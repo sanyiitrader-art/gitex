@@ -1,10 +1,6 @@
 name: Build Gitex APK
 
 on:
-  push:
-    branches: ["**"]
-    paths-ignore:
-      - "**.md"
   workflow_dispatch:
 
 concurrency:
