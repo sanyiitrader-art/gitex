@@ -4,10 +4,12 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
@@ -15,6 +17,7 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -24,13 +27,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
-import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -52,17 +56,20 @@ private const val MAX_PROJECT_HITS = 1_500
 private const val MAX_HITS_PER_FILE = 60
 private const val MAX_SEARCH_BYTES = 1_500_000L
 
-/** One hit per line, starting at the first match in that line. Linear scan, no per-line copies of the whole text. */
+/**
+ * One hit per line, starting at the first match in that line (0-based line and column).
+ * Single linear pass: newlines are counted incrementally, never re-scanned.
+ */
 private fun scan(s: String, q: String, maxHits: Int, onHit: (line: Int, col: Int, text: String) -> Unit) {
     var from = 0
     var line = 0
-    var lineStart = 0
     var counted = 0
+    var scanned = 0 // newlines before this index are already counted in `line`
     while (counted < maxHits) {
         val i = s.indexOf(q, from, ignoreCase = true)
         if (i < 0) break
-        for (k in lineStart until i) if (s[k] == '\n') { line++ }
-        // `line` now counts newlines before i; recompute lineStart for the match position.
+        for (k in scanned until i) if (s[k] == '\n') line++
+        scanned = i
         val ls = s.lastIndexOf('\n', i - 1) + 1
         var le = s.indexOf('\n', i)
         if (le < 0) le = s.length
@@ -70,18 +77,12 @@ private fun scan(s: String, q: String, maxHits: Int, onHit: (line: Int, col: Int
         if (end > ls && s[end - 1] == '\r') end--
         onHit(line, i - ls, s.substring(ls, end))
         counted++
-        lineStart = ls.coerceAtLeast(i)
-        // continue on the next line
         from = le + 1
-        lineStart = i
         if (from > s.length) break
-        // account for the newline at `le` when counting
-        for (k in i until from.coerceAtMost(s.length)) if (s[k] == '\n') line++
-        lineStart = from
     }
 }
 
-private fun snippet(text: String, col: Int, len: Int, hl: androidx.compose.ui.graphics.Color, hlBg: androidx.compose.ui.graphics.Color): AnnotatedString {
+private fun snippet(text: String, col: Int, len: Int, hl: Color, hlBg: Color): AnnotatedString {
     val s = text.substring(col.coerceIn(0, text.length)).trimEnd().take(240)
     return buildAnnotatedString {
         append(s)
@@ -112,33 +113,7 @@ private fun SearchBar(
             )
             Spacer(Modifier.width(8.dp))
         }
-        Box(Modifier.fillMaxWidth().padding(top = 0.dp).background(Gx.border).padding(top = 1.dp))
-    }
-}
-
-@Composable
-private fun HitCard(
-    strip: @Composable () -> Unit,
-    body: AnnotatedString,
-    onClick: () -> Unit,
-) {
-    GCard(Modifier.fillMaxWidth(), onClick = onClick, padding = androidx.compose.foundation.layout.PaddingValues(0.dp)) {
-        Column {
-            Row(
-                Modifier.fillMaxWidth().background(Gx.surfaceHigh).padding(horizontal = 12.dp, vertical = 7.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) { strip() }
-            Box(Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
-                GText(
-                    body.text, // placeholder to keep type; replaced below by annotated text
-                    maxLines = 1,
-                    color = Gx.text,
-                    fontFamily = FontFamily.Monospace,
-                    style = Ty.small,
-                    modifier = Modifier
-                )
-            }
-        }
+        Box(Modifier.fillMaxWidth().height(1.dp).background(Gx.border))
     }
 }
 
@@ -155,8 +130,7 @@ fun SearchInFileScreen(
     val q = SearchMemory.fileQuery
     var hits by remember { mutableStateOf<List<FileHit>>(emptyList()) }
     var busy by remember { mutableStateOf(false) }
-    val accent = Gx.accent
-    val hlBg = accent.copy(alpha = 0.35f)
+    val hlBg = Gx.accent.copy(alpha = 0.35f)
 
     LaunchedEffect(q.text, ws.current) {
         val query = q.text
@@ -182,26 +156,26 @@ fun SearchInFileScreen(
                 hits.isEmpty() && !busy -> EmptyNote("nothing match")
                 else -> LazyColumn(
                     Modifier.fillMaxSize(),
-                    contentPadding = androidx.compose.foundation.layout.PaddingValues(12.dp),
+                    contentPadding = PaddingValues(12.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     items(hits, key = { it.line }) { h ->
                         GCard(
                             Modifier.fillMaxWidth(),
                             onClick = { onPick(h.line, h.col, q.text.length) },
-                            padding = androidx.compose.foundation.layout.PaddingValues(0.dp)
+                            padding = PaddingValues(0.dp)
                         ) {
                             Column {
                                 Row(
                                     Modifier.fillMaxWidth().background(Gx.surfaceHigh).padding(horizontal = 12.dp, vertical = 7.dp)
                                 ) { GText("[Line ${h.line + 1}]", style = Ty.small, color = Gx.accent, maxLines = 1) }
                                 Box(Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
-                                    androidx.compose.material3.Text(
+                                    Text(
                                         snippet(h.text, h.col, q.text.length, Gx.text, hlBg),
                                         color = Gx.text,
                                         style = Ty.small.copy(fontFamily = FontFamily.Monospace),
                                         maxLines = 1,
-                                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                                        overflow = TextOverflow.Ellipsis
                                     )
                                 }
                             }
@@ -250,7 +224,7 @@ fun FindInProjectScreen(
                 } ?: continue
                 val before = acc.size
                 scan(text, query, MAX_HITS_PER_FILE) { line, col, t -> acc.add(ProjHit(path, line, col, t)) }
-                if (acc.size != before && (acc.size - before >= 1)) {
+                if (acc.size != before) {
                     // publish progressively so results appear while the scan continues
                     val snapshot = ArrayList(acc)
                     withContext(Dispatchers.Main) { hits = snapshot }
@@ -270,7 +244,7 @@ fun FindInProjectScreen(
                 hits.isEmpty() && !busy -> EmptyNote("nothing match")
                 else -> LazyColumn(
                     Modifier.fillMaxSize().navigationBarsPadding(),
-                    contentPadding = androidx.compose.foundation.layout.PaddingValues(12.dp),
+                    contentPadding = PaddingValues(12.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     items(hits, key = { "${it.path}:${it.line}" }) { h ->
@@ -278,7 +252,7 @@ fun FindInProjectScreen(
                         GCard(
                             Modifier.fillMaxWidth(),
                             onClick = { onPick(h.path, h.line, h.col, q.text.length) },
-                            padding = androidx.compose.foundation.layout.PaddingValues(0.dp)
+                            padding = PaddingValues(0.dp)
                         ) {
                             Column {
                                 Row(
@@ -292,12 +266,12 @@ fun FindInProjectScreen(
                                     GText("Line ${h.line + 1}", style = Ty.small, color = Gx.accent, maxLines = 1)
                                 }
                                 Box(Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
-                                    androidx.compose.material3.Text(
+                                    Text(
                                         snippet(h.text, h.col, q.text.length, Gx.text, hlBg),
                                         color = Gx.text,
                                         style = Ty.small.copy(fontFamily = FontFamily.Monospace),
                                         maxLines = 1,
-                                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                                        overflow = TextOverflow.Ellipsis
                                     )
                                 }
                             }
