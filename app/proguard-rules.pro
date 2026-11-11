@@ -15,8 +15,14 @@
 -dontwarn com.googlecode.javaewah.**
 -dontwarn org.eclipse.jgit.**
 
-# Editor widget is created from code.
--keep class io.github.rosemoe.sora.widget.CodeEditor { *; }
+# Sora Editor: Gitex adjusts it by name (colour ids, settings, internals), so
+# nothing in it may be renamed or removed by R8.
+-keep class io.github.rosemoe.sora.** { *; }
+-keep interface io.github.rosemoe.sora.** { *; }
+-dontwarn io.github.rosemoe.sora.**
+
+# Markwon
+-dontwarn io.noties.markwon.**
 
 # BuildConfig (OAuth client id).
 -keep class app.gitex.BuildConfig { *; }
