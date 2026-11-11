@@ -25,6 +25,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
@@ -610,14 +611,14 @@ fun ExplorerDrawerContent(
         )
     }
     itemMenu?.let { (pos, item) ->
-        val items = buildList {
+        val menuItems = buildList {
             add(MenuItem("Rename") { startRename(item.file) })
             if (!item.isDir) add(MenuItem("Select") {
                 st.cancel(); st.mode = XMode.Select; st.selected.add(item.file.absolutePath)
             })
             add(MenuItem("Delete", danger = true) { delTarget = item.file })
         }
-        ContextMenu(pos, items, onDismiss = { itemMenu = null })
+        ContextMenu(pos, menuItems, onDismiss = { itemMenu = null })
     }
     delTarget?.let { f ->
         GDialog(
