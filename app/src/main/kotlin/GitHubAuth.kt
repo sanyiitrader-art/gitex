@@ -91,4 +91,95 @@ object GitHubAuth {
     )
 
     /** Starts the flow. Throws an Exception with a readable message on failure. */
-    suspend fun requestCode(): Devi
+    suspend fun requestCode(): DeviceCode {
+        val r = try {
+            Http.request(
+                "POST", "https://github.com/login/device/code", formHeaders,
+                form("client_id" to clientId, "scope" to SCOPE)
+            )
+        } catch (e: Exception) {
+            throw Exception(Http.describe(e))
+        }
+        val j = try {
+            JSONObject(r.body)
+        } catch (_: Exception) {
+            throw Exception("GitHub sent an unexpected answer (HTTP ${r.code})")
+        }
+        if (j.has("error")) {
+            throw Exception(
+                when (j.optString("error")) {
+                    "device_flow_disabled" -> "Device Flow is turned off for this OAuth App. Enable it in the app's settings on GitHub."
+                    "incorrect_client_credentials" -> "GitHub doesn't recognise this OAuth client id."
+                    else -> j.optString("error_description").ifBlank { j.optString("error") }
+                }
+            )
+        }
+        return DeviceCode(
+            deviceCode = j.getString("device_code"),
+            userCode = j.getString("user_code"),
+            verificationUri = j.optString("verification_uri", "https://github.com/login/device"),
+            expiresIn = j.optInt("expires_in", 900),
+            interval = j.optInt("interval", 5).coerceAtLeast(5),
+        )
+    }
+
+    /** Waits (cancellable) until the user authorizes, denies, or the code expires. */
+    suspend fun pollForToken(dc: DeviceCode): Poll {
+        val deadline = SystemClock.elapsedRealtime() + dc.expiresIn * 1000L
+        var interval = dc.interval
+        var failures = 0
+        while (SystemClock.elapsedRealtime() < deadline) {
+            delay(interval * 1000L)
+            val r = try {
+                Http.request(
+                    "POST", "https://github.com/login/oauth/access_token", formHeaders,
+                    form(
+                        "client_id" to clientId,
+                        "device_code" to dc.deviceCode,
+                        "grant_type" to "urn:ietf:params:oauth:grant-type:device_code"
+                    )
+                )
+            } catch (e: Exception) {
+                if (++failures >= 6) return Poll.Error(Http.describe(e))
+                continue
+            }
+            failures = 0
+            val j = try {
+                JSONObject(r.body)
+            } catch (_: Exception) {
+                continue
+            }
+            val token = j.optString("access_token")
+            if (token.isNotEmpty()) return Poll.Token(token)
+            when (val err = j.optString("error")) {
+                "authorization_pending" -> {}
+                "slow_down" -> interval = j.optInt("interval", interval + 5).coerceAtLeast(interval + 5)
+                "expired_token" -> return Poll.Expired
+                "access_denied" -> return Poll.Denied
+                "" -> {}
+                else -> return Poll.Error(j.optString("error_description").ifBlank { err })
+            }
+        }
+        return Poll.Expired
+    }
+
+    /** The account's login name, or null if the lookup fails. */
+    suspend fun fetchLogin(token: String): String? = try {
+        val r = Http.request(
+            "GET", "https://api.github.com/user",
+            mapOf("Authorization" to "Bearer $token", "Accept" to "application/vnd.github+json")
+        )
+        if (r.code == 200) JSONObject(r.body).optString("login").ifBlank { null } else null
+    } catch (_: Exception) {
+        null
+    }
+
+    /**
+     * Disconnect removes the token from this phone. GitHub only lets an app revoke its own token
+     * with the client secret, which the app deliberately doesn't have, so the settings screen
+     * also points to github.com/settings/applications where it can be revoked for good.
+     */
+    fun disconnect() {
+        Prefs.clearGithubToken()
+    }
+}
