@@ -1,0 +1,122 @@
+name: Build Gitex APK
+
+on:
+  push:
+    branches: ["**"]
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      GITEX_CLIENT_ID: ${{ vars.GITEX_CLIENT_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools platforms;android-36 build-tools;36.0.0"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.13"
+
+      - name: Install image tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq imagemagick librsvg2-bin
+
+      - name: Generate launcher icons from icon.png
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f icon.png ]; then
+            echo "::error::icon.png is missing from the repository root"
+            exit 1
+          fi
+          RES=app/src/main/res
+          mkdir -p "$RES/mipmap-anydpi" "$RES/values"
+
+          # Remove uniform padding (transparent, black or white), then make it square.
+          convert icon.png -fuzz 8% -trim +repage /tmp/trimmed.png
+          SIZE=$(identify -format '%[fx:max(w,h)]' /tmp/trimmed.png)
+          convert /tmp/trimmed.png -background none -gravity center \
+            -extent "${SIZE}x${SIZE}" +repage /tmp/square.png
+
+          # Background colour = a corner pixel of the trimmed artwork.
+          BG=$(convert /tmp/square.png -format '%[hex:u.p{2,2}]' info: | cut -c1-6)
+          cat > "$RES/values/ic_launcher_background.xml" <<EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="ic_launcher_background">#${BG}</color>
+          </resources>
+          EOF
+
+          # Adaptive foreground: 108dp canvas, artwork at about 70% (safe zone).
+          for entry in mdpi:108 hdpi:162 xhdpi:216 xxhdpi:324 xxxhdpi:432; do
+            d="${entry%%:*}"; px="${entry##*:}"
+            art=$(( px * 70 / 100 ))
+            mkdir -p "$RES/mipmap-$d"
+            convert /tmp/square.png -resize "${art}x${art}" -background none \
+              -gravity center -extent "${px}x${px}" "$RES/mipmap-$d/ic_launcher_foreground.png"
+          done
+
+          cat > "$RES/mipmap-anydpi/ic_launcher.xml" <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background" />
+              <foreground android:drawable="@mipmap/ic_launcher_foreground" />
+          </adaptive-icon>
+          EOF
+
+      - name: Fetch file-type icons
+        continue-on-error: true
+        run: bash scripts/fetch-icons.sh
+
+      - name: Restore throwaway test keystore
+        id: keystore
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: gitex-debug-keystore-v1
+
+      - name: Create throwaway test keystore if missing
+        run: |
+          mkdir -p ~/.android
+          if [ ! -f ~/.android/debug.keystore ]; then
+            keytool -genkeypair -keystore ~/.android/debug.keystore \
+              -storepass android -keypass android -alias androiddebugkey \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - name: Build universal APK
+        run: gradle :app:assembleRelease --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gitex-test-APK
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 30
