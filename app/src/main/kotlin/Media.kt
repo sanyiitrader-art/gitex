@@ -18,7 +18,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -42,7 +41,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.FileProvider
 import io.noties.markwon.Markwon
 import io.noties.markwon.ext.strikethrough.StrikethroughPlugin
-import io.noties.markwon.ext.tables.TablesPlugin
+import io.noties.markwon.ext.tables.TablePlugin
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -137,7 +136,7 @@ fun MarkdownPreview(text: String, modifier: Modifier = Modifier) {
     val markwon = remember {
         Markwon.builder(ctx)
             .usePlugin(StrikethroughPlugin.create())
-            .usePlugin(TablesPlugin.create(ctx))
+            .usePlugin(TablePlugin.create(ctx))
             .build()
     }
     val parsed by produceState<Spanned?>(null, text) {
