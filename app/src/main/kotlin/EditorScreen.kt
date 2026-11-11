@@ -20,7 +20,6 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.getBottom
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.ime
@@ -37,6 +36,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
@@ -62,7 +62,6 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
-import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.zIndex
 import kotlinx.coroutines.launch
 import java.io.File
@@ -449,18 +448,21 @@ fun MainScreen(
     }
     if (dReplace) {
         var find by remember { mutableStateOf(TextFieldValue("")) }
-        var with by remember { mutableStateOf(TextFieldValue("")) }
+        var repl by remember { mutableStateOf(TextFieldValue("")) }
         val go = {
             if (find.text.isNotEmpty()) {
-                val n = handle.replaceAll(find.text, with.text)
-                Banners.show(if (n == 0) "Nothing found" else "Replaced $n occurrence${if (n == 1) "" else "s"}", if (n == 0) BannerKind.Info else BannerKind.Success)
+                val n = handle.replaceAll(find.text, repl.text)
+                Banners.show(
+                    if (n == 0) "Nothing found" else "Replaced $n occurrence${if (n == 1) "" else "s"}",
+                    if (n == 0) BannerKind.Info else BannerKind.Success
+                )
                 dReplace = false
             }
         }
         GDialog(onDismiss = { dReplace = false }, title = "Replace", actions = listOf(DialogBtn("Replace", go, primary = true, enabled = find.text.isNotEmpty()))) {
             GInput(find, { find = it }, Modifier.fillMaxWidth(), placeholder = "Find", imeAction = ImeAction.Next)
             Spacer(Modifier.height(10.dp))
-            GInput(with, { with = it }, Modifier.fillMaxWidth(), placeholder = "Replace with", onDone = go)
+            GInput(repl, { repl = it }, Modifier.fillMaxWidth(), placeholder = "Replace with", onDone = go)
         }
     }
     if (dGoto) {
