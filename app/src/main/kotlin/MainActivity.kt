@@ -54,7 +54,7 @@ class MainActivity : ComponentActivity() {
 
 enum class Route {
     Onboarding, Welcome, Main, SearchFile, SearchProject,
-    Settings, SetEditor, SetAppearance, SetTheme, SetGithub, Recycle, Actions, Log
+    Settings, SetEditor, SetAppearance, SetTheme, SetGithub, SetAi, Recycle, Actions, Log
 }
 
 @Composable
@@ -67,7 +67,6 @@ fun GitexRoot() {
     val scope = rememberCoroutineScope()
     val lifecycle = LocalLifecycleOwner.current.lifecycle
 
-    // Light status/navigation icons on dark themes and the reverse.
     val dark = Gx.isDark
     SideEffect {
         val w = (view.context as Activity).window
@@ -116,14 +115,13 @@ fun GitexRoot() {
         }
     }
 
-    // Duplicate-content check: a few seconds after the project or its files change (restarts on every change).
+    // Duplicate-content check: a few seconds after the project or its files change.
     LaunchedEffect(ws.treeVersion, ws.projectRoot, Prefs.duplicateWarnings) {
         if (ws.projectRoot == null || !Prefs.onboardingDone) return@LaunchedEffect
         delay(4000)
         Duplicates.scan(ws)
     }
 
-    // Coming back to the app: pick up files changed by other apps.
     DisposableEffect(lifecycle) {
         val obs = LifecycleEventObserver { _, e ->
             if (e == Lifecycle.Event.ON_RESUME && Prefs.onboardingDone) {
@@ -191,6 +189,7 @@ fun GitexRoot() {
                 Route.SetAppearance -> AppearanceSettingsScreen({ back() }, { go(it) })
                 Route.SetTheme -> ThemePickerScreen { back() }
                 Route.SetGithub -> GitHubSettingsScreen { back() }
+                Route.SetAi -> AiSettingsScreen { back() }
                 Route.Recycle -> RecycleBinScreen(ws) { back() }
                 Route.Actions -> ActionsScreen(ws, onBack = { back() }, onOpenLog = { run ->
                     ActionsNav.logRepo = run.fullName
