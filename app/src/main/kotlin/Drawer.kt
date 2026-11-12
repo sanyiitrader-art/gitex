@@ -546,7 +546,7 @@ fun ExplorerDrawerContent(
                 }
             }
 
-            // ---- floating search results ----
+            // ---- floating search results (clear accent border + glow so it stands out) ----
             if (st.searching && root != null) {
                 val files by produceState(emptyList<File>(), root, ws.treeVersion) { value = ws.projectFiles() }
                 val q = st.query.text.trim()
@@ -557,8 +557,8 @@ fun ExplorerDrawerContent(
                 Box(
                     Modifier.align(Alignment.TopCenter).padding(horizontal = 12.dp, vertical = 4.dp)
                         .fillMaxWidth().heightIn(max = maxHeight / 2)
-                        .interactive().glow(Shapes.card, Color.Black.copy(alpha = 0.6f), 12.dp)
-                        .clip(Shapes.card).background(Gx.surface).border(1.dp, Gx.border, Shapes.card)
+                        .interactive().glow(Shapes.card, Gx.accent.copy(alpha = 0.45f), 14.dp)
+                        .clip(Shapes.card).background(Gx.surfaceHigh).border(1.5.dp, Gx.accent, Shapes.card)
                 ) {
                     when {
                         q.isEmpty() -> EmptyNote("type to search")
