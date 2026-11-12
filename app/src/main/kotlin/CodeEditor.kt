@@ -13,12 +13,10 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -30,6 +28,7 @@ import io.github.rosemoe.sora.event.SelectionChangeEvent
 import io.github.rosemoe.sora.lang.EmptyLanguage
 import io.github.rosemoe.sora.lang.analysis.AnalyzeManager
 import io.github.rosemoe.sora.lang.analysis.SimpleAnalyzeManager
+import io.github.rosemoe.sora.lang.analysis.StyleReceiver
 import io.github.rosemoe.sora.lang.styling.CodeBlock
 import io.github.rosemoe.sora.lang.styling.MappedSpans
 import io.github.rosemoe.sora.lang.styling.Styles
@@ -43,7 +42,7 @@ import java.util.concurrent.atomic.AtomicInteger
 // ---------------------------------------------------------------------------
 // Small reflection helpers. Sora's cosmetic setters and colour-id constants have
 // moved between 0.2x releases, so optional tweaks go through these and can never
-// break the build; the core calls below use the API directly.
+// break the build. (proguard-rules.pro keeps Sora's names so this works in release.)
 // ---------------------------------------------------------------------------
 
 private fun coerce(v: Any, t: Class<*>): Any = when (t) {
@@ -122,6 +121,12 @@ private class BracketData(val line: IntArray, val col: IntArray, val match: IntA
 
 private val styleExec = Executors.newSingleThreadExecutor { r -> Thread(r, "gitex-style").apply { isDaemon = true } }
 
+private val receiverField = try {
+    SimpleAnalyzeManager::class.java.getDeclaredField("receiver").also { it.isAccessible = true }
+} catch (_: Throwable) {
+    null
+}
+
 class LexAnalyzer(
     private val lang: LangDef?,
     tokenIds: IntArray,
@@ -143,11 +148,20 @@ class LexAnalyzer(
     private val ticket = AtomicInteger()
     private var lastPair = -1L
 
-    override fun analyze(text: StringBuilder, delegate: SimpleAnalyzeManager.Delegate<Any>): Styles {
+    private fun currentReceiver(): StyleReceiver? = try {
+        receiverField?.get(this) as? StyleReceiver
+    } catch (_: Throwable) {
+        null
+    }
+
+    override fun analyze(text: StringBuilder, delegate: SimpleAnalyzeManager<Any>.Delegate<Any>): Styles {
+        val cancelM = try { delegate.javaClass.getMethod("isCancelled") } catch (_: Throwable) { null }
+        val cancelled = { try { (cancelM?.invoke(delegate) as? Boolean) ?: false } catch (_: Throwable) { false } }
+
         val d = SpanData()
         val l = lang
         if (highlight && l != null) {
-            Lexer.run(text, l, { delegate.isCancelled }) { line, col, kind -> d.add(line, col, kind) }
+            Lexer.run(text, l, cancelled) { line, col, kind -> d.add(line, col, kind) }
         }
         if (d.n == 0) d.add(0, 0, Tok.PLAIN)
         var lines = 1
@@ -219,7 +233,7 @@ class LexAnalyzer(
             lastPair = key
             val st = if (m >= 0) build(d, pack(br.line[idx], br.col[idx]), pack(br.line[m], br.col[m]))
             else build(d, -1L, -1L)
-            if (ticket.get() == req) receiver?.setStyles(this, st)
+            if (ticket.get() == req) currentReceiver()?.setStyles(this, st)
         }
     }
 
