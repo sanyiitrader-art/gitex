@@ -1,5 +1,14 @@
 name: Build Gitex APK
 
+# Manual only while developing: commit as many files as you like, then press
+# Actions → "Build Gitex APK" → Run workflow.
+# Later, when Gitex itself pushes your changes, replace this block with:
+#   on:
+#     push:
+#       branches: ["**"]
+#       paths-ignore: ["**.md"]
+#     workflow_dispatch:
+# (A commit message containing [skip ci] also skips automatic runs.)
 on:
   workflow_dispatch:
 
@@ -37,10 +46,24 @@ jobs:
         with:
           gradle-version: "8.13"
 
-      - name: Install image tools
+      - name: Install image tools (best effort)
+        continue-on-error: true
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq imagemagick librsvg2-bin
+          for attempt in 1 2 3; do
+            sudo apt-get update -qq && \
+            sudo apt-get install -y -qq --fix-missing imagemagick librsvg2-bin && break
+            echo "apt attempt $attempt failed, retrying..."
+            sleep 8
+          done
+
+      - name: Check image tools
+        run: |
+          if command -v convert >/dev/null 2>&1 || command -v magick >/dev/null 2>&1; then
+            echo "ImageMagick is available"
+          else
+            echo "::error::ImageMagick is not available and could not be installed. Re-run the workflow."
+            exit 1
+          fi
 
       - name: Generate launcher icons from icon.png
         shell: bash
@@ -49,6 +72,11 @@ jobs:
           if [ ! -f icon.png ]; then
             echo "::error::icon.png is missing from the repository root"
             exit 1
+          fi
+          # ImageMagick 7 only ships "magick"; map the classic commands onto it.
+          if ! command -v convert >/dev/null 2>&1; then
+            convert() { magick "$@"; }
+            identify() { magick identify "$@"; }
           fi
           RES=app/src/main/res
           mkdir -p "$RES/mipmap-anydpi" "$RES/values"
