@@ -1,6 +1,7 @@
 package app.gitex
 
 import android.app.Activity
+import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -10,8 +11,6 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.tween
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -19,7 +18,6 @@ import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.core.view.WindowCompat
@@ -28,6 +26,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -35,13 +34,27 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        readNotificationIntent(intent)
         setContent { GitexTheme { GitexRoot() } }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        readNotificationIntent(intent)
+    }
+
+    /** Notification buttons open this activity with extras telling which screen and which build to show. */
+    private fun readNotificationIntent(i: Intent?) {
+        val route = i?.getStringExtra("route") ?: return
+        NavBus.pending = NavRequest(route, i.getStringExtra("repo"), i.getLongExtra("run", 0L))
+        i.removeExtra("route")
     }
 }
 
 enum class Route {
     Onboarding, Welcome, Main, SearchFile, SearchProject,
-    Settings, SetEditor, SetAppearance, SetTheme, SetGithub, Recycle, Actions
+    Settings, SetEditor, SetAppearance, SetTheme, SetGithub, Recycle, Actions, Log
 }
 
 @Composable
@@ -78,11 +91,44 @@ fun GitexRoot() {
 
     LaunchedEffect(route == Route.Main) { if (route == Route.Main) ws.restore() }
 
+    // Opened from a build notification: jump straight to the right screen.
+    val pending = NavBus.pending
+    LaunchedEffect(pending) {
+        val p = NavBus.pending ?: return@LaunchedEffect
+        NavBus.pending = null
+        if (!Prefs.onboardingDone || !Prefs.welcomeDone) return@LaunchedEffect
+        stack.clear()
+        stack.add(Route.Main)
+        when (p.route) {
+            "log" -> {
+                ActionsNav.tab = 2
+                ActionsNav.logRepo = p.repo
+                ActionsNav.logRunId = p.runId
+                stack.add(Route.Actions)
+                stack.add(Route.Log)
+            }
+            "artifacts" -> {
+                ActionsNav.tab = 0
+                ActionsNav.highlightRun = p.runId
+                stack.add(Route.Actions)
+            }
+            else -> stack.add(Route.Actions)
+        }
+    }
+
+    // Duplicate-content check: a few seconds after the project or its files change (restarts on every change).
+    LaunchedEffect(ws.treeVersion, ws.projectRoot, Prefs.duplicateWarnings) {
+        if (ws.projectRoot == null || !Prefs.onboardingDone) return@LaunchedEffect
+        delay(4000)
+        Duplicates.scan(ws)
+    }
+
     // Coming back to the app: pick up files changed by other apps.
     DisposableEffect(lifecycle) {
         val obs = LifecycleEventObserver { _, e ->
             if (e == Lifecycle.Event.ON_RESUME && Prefs.onboardingDone) {
                 scope.launch { ws.refreshFromDisk() }
+                BuildState.refreshTick++
             }
         }
         lifecycle.addObserver(obs)
@@ -146,18 +192,14 @@ fun GitexRoot() {
                 Route.SetTheme -> ThemePickerScreen { back() }
                 Route.SetGithub -> GitHubSettingsScreen { back() }
                 Route.Recycle -> RecycleBinScreen(ws) { back() }
-                Route.Actions -> ActionsPlaceholder { back() }
+                Route.Actions -> ActionsScreen(ws, onBack = { back() }, onOpenLog = { run ->
+                    ActionsNav.logRepo = run.fullName
+                    ActionsNav.logRunId = run.id
+                    go(Route.Log)
+                })
+                Route.Log -> LogScreen(ActionsNav.logRepo, ActionsNav.logRunId) { back() }
             }
         }
         BannerHost()
-    }
-}
-
-/** Replaced by the real Actions screen (Artifacts, Create, Failed Builds) in Phase 2. */
-@Composable
-private fun ActionsPlaceholder(onBack: () -> Unit) {
-    Column(Modifier.fillMaxSize()) {
-        ScreenBar("Actions", onBack)
-        EmptyNote("Builds, artifacts and logs arrive in the next build.")
     }
 }
