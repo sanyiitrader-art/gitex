@@ -272,15 +272,22 @@ class LexAnalyzer(
         return BracketData(ls.toIntArray(), cs.toIntArray(), match)
     }
 
-    /** One block per indentation level; Sora draws these as the vertical guide lines. */
+    /**
+     * One block per indentation level; Sora draws these as the vertical guide lines.
+     * A line that contains only whitespace (for example the fresh indented line right after
+     * pressing Enter) may open a block, so its guide shows immediately, but it never closes one.
+     */
     private fun computeBlocks(text: CharSequence): List<CodeBlock> {
         val n = text.length
         var iw = IntArray(1024)
         var ic = IntArray(1024)
+        var sf = BooleanArray(1024)
         var lines = 0
         var i = 0
         while (i <= n) {
-            if (lines == iw.size) { iw = iw.copyOf(lines * 2); ic = ic.copyOf(lines * 2) }
+            if (lines == iw.size) {
+                iw = iw.copyOf(lines * 2); ic = ic.copyOf(lines * 2); sf = sf.copyOf(lines * 2)
+            }
             var w = 0
             var c = 0
             var j = i
@@ -289,8 +296,9 @@ class LexAnalyzer(
                 c++; j++
             }
             val blank = j >= n || text[j] == '\n' || text[j] == '\r'
-            iw[lines] = if (blank) -1 else w
+            iw[lines] = if (blank && c == 0) -1 else w
             ic[lines] = c
+            sf[lines] = blank && c > 0
             lines++
             while (j < n && text[j] != '\n') j++
             i = j + 1
@@ -311,6 +319,13 @@ class LexAnalyzer(
         for (ln in 0 until lines) {
             val w = iw[ln]
             if (w < 0) continue
+            if (sf[ln]) {
+                if (prev >= 0 && w > prevW) {
+                    stStart.add(prev); stW.add(prevW)
+                    prev = ln; prevW = w
+                }
+                continue
+            }
             while (stW.isNotEmpty() && w <= stW.last()) {
                 close(stStart.removeAt(stStart.lastIndex), prev); stW.removeAt(stW.lastIndex)
             }
@@ -512,6 +527,48 @@ private class Applied(var buffer: BufferState) {
     var fontKey = ""
     var settingText = false
     var analyzer: LexAnalyzer? = null
+    var lang: LangDef? = null
+    var lastCount = 0
+    var applying = false
+}
+
+/**
+ * Smart Enter. Runs right after a new line was inserted: gives the new line the previous line's
+ * indentation, plus one level after { ( [ (and after ":" in Python-like languages). Pressing Enter
+ * between a bracket pair puts the closing bracket on its own line and the caret on the indented line.
+ */
+private fun smartEnter(ed: CodeEditor, a: Applied) {
+    try {
+        val t = ed.text
+        val cur = ed.cursor
+        if (cur.isSelected) return
+        val line = cur.leftLine
+        if (line < 1 || line >= t.lineCount) return
+        val col = cur.leftColumn.coerceAtMost(t.getColumnCount(line))
+        val before = t.getLineString(line).substring(0, col)
+        if (before.any { it != ' ' && it != '\t' }) return
+        val prev = t.getLineString(line - 1)
+        val base = prev.takeWhile { it == ' ' || it == '\t' }
+        val last = prev.trimEnd().lastOrNull()
+        val lang = a.lang
+        val opens = last == '{' || last == '(' || last == '[' || (lang?.colonIndent == true && last == ':')
+        val unit = if (lang?.id == "makefile") "\t" else " ".repeat(Prefs.indentWidth)
+        val want = if (opens) base + unit else base
+        a.applying = true
+        try {
+            if (before != want) t.replace(line, 0, line, col, want)
+            val closer = when (last) { '{' -> '}'; '(' -> ')'; '[' -> ']'; else -> null }
+            val rest = t.getLineString(line)
+            if (closer != null && want.length < rest.length && rest[want.length] == closer) {
+                t.insert(line, want.length, "\n$base")
+            }
+            ed.setSelection(line, want.length)
+        } finally {
+            a.applying = false
+        }
+        a.lastCount = t.lineCount
+    } catch (_: Throwable) {
+    }
 }
 
 @Composable
@@ -551,6 +608,12 @@ fun CodeEditorView(
                 if (a != null && !a.settingText) {
                     ws.onEdited(a.buffer.path)
                     handle.refreshUndo()
+                    val count = ed.text.lineCount
+                    val prevCount = a.lastCount
+                    a.lastCount = count
+                    if (!a.applying && Prefs.smartActions && prevCount > 0 && count == prevCount + 1) {
+                        ed.post { smartEnter(ed, a) }
+                    }
                 }
             }
             ed.subscribeEvent(SelectionChangeEvent::class.java) { _, _ ->
@@ -566,11 +629,15 @@ fun CodeEditorView(
             poke(ed, "wordwrap", false)
             poke(ed, "lineNumberEnabled", true)
             poke(ed, "scalable", false)
+            // Keep the line numbers fixed on the left while the code scrolls sideways.
+            poke(ed, "pinLineNumber", true)
+            poke(ed.props, "pinLineNumber", true)
             ed
         },
         update = { ed ->
             val ap = ed.tag as Applied
             ap.buffer = buffer
+            ap.lang = lang
 
             if (ap.fontKey != fontKey) {
                 val tf = Fonts.typeface(ctx, fontKey)
@@ -593,6 +660,7 @@ fun CodeEditorView(
                 ap.content = content
                 ap.ver = ver
                 ap.sig = ""
+                ap.lastCount = content.lineCount
                 try {
                     val ln = buffer.cursorLine.coerceIn(0, content.lineCount - 1)
                     ed.setSelection(ln, buffer.cursorCol.coerceIn(0, content.getColumnCount(ln)))
