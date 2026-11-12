@@ -1,8 +1,10 @@
 # ---- Gitex R8 rules ----
 
-# JGit loads translated messages by reflecting over public fields.
--keep class org.eclipse.jgit.internal.JGitText { *; }
--keep class * extends org.eclipse.jgit.nls.TranslationBundle { *; }
+# JGit does a lot by reflection and service lookup (messages, transports, config). It is kept whole for
+# now so Git works reliably; it can be trimmed later once everything is tested.
+-keep class org.eclipse.jgit.** { *; }
+-keep interface org.eclipse.jgit.** { *; }
+-keep class com.googlecode.javaewah.** { *; }
 
 # Classes JGit references that do not exist on Android.
 -dontwarn java.lang.ProcessHandle
