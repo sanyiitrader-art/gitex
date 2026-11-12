@@ -1,7 +1,15 @@
 package app.gitex
 
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.eclipse.jgit.api.Git
 import org.eclipse.jgit.api.MergeCommand
@@ -9,23 +17,30 @@ import org.eclipse.jgit.api.ResetCommand
 import org.eclipse.jgit.api.errors.CheckoutConflictException
 import org.eclipse.jgit.dircache.DirCacheEditor
 import org.eclipse.jgit.dircache.DirCacheEntry
+import org.eclipse.jgit.errors.NoRemoteRepositoryException
 import org.eclipse.jgit.lib.Constants
 import org.eclipse.jgit.lib.FileMode
+import org.eclipse.jgit.lib.NullProgressMonitor
+import org.eclipse.jgit.lib.ObjectId
 import org.eclipse.jgit.lib.Repository
+import org.eclipse.jgit.lib.RepositoryState
 import org.eclipse.jgit.storage.file.WindowCacheConfig
 import org.eclipse.jgit.transport.RefSpec
 import org.eclipse.jgit.transport.RemoteRefUpdate
 import org.eclipse.jgit.transport.UsernamePasswordCredentialsProvider
+import org.json.JSONObject
 import java.io.File
 import java.net.ConnectException
 import java.net.SocketException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
+import kotlin.coroutines.coroutineContext
+import kotlin.coroutines.resume
 
 sealed class GitResult {
-    class Committed(val sha: String, val files: Int) : GitResult()
+    class Committed(val sha: String, val files: Int, val skipped: List<String> = emptyList()) : GitResult()
     object NothingToCommit : GitResult()
-    class Pushed(val sha: String, val upToDate: Boolean) : GitResult()
+    class Pushed(val sha: String, val upToDate: Boolean, val skipped: List<String> = emptyList()) : GitResult()
     class Rejected(val detail: String, val remoteAhead: Boolean) : GitResult()
     class AuthFailed(val detail: String) : GitResult()
     class NotFound(val detail: String) : GitResult()
@@ -41,24 +56,86 @@ sealed class MergeOutcome {
     class Failed(val detail: String) : MergeOutcome()
 }
 
+class Measure(val files: Int, val bytes: Long)
+
+/** Connectivity helpers: Gitex waits for the network instead of failing. */
+object Net {
+    private fun cm(ctx: Context) = ctx.getSystemService(ConnectivityManager::class.java)
+
+    fun online(ctx: Context): Boolean = try {
+        val m = cm(ctx)
+        val n = m.activeNetwork
+        val c = if (n == null) null else m.getNetworkCapabilities(n)
+        c != null && c.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    } catch (_: Exception) {
+        true
+    }
+
+    /** Returns at once if online, otherwise suspends until a network is available. */
+    suspend fun await(ctx: Context) {
+        if (online(ctx)) return
+        suspendCancellableCoroutine<Unit> { cont ->
+            val m = cm(ctx)
+            val cb = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    if (cont.isActive) cont.resume(Unit)
+                    try { m.unregisterNetworkCallback(this) } catch (_: Exception) { }
+                }
+            }
+            try {
+                m.registerDefaultNetworkCallback(cb)
+            } catch (e: Exception) {
+                if (cont.isActive) cont.resume(Unit)
+                return@suspendCancellableCoroutine
+            }
+            cont.invokeOnCancellation { try { m.unregisterNetworkCallback(cb) } catch (_: Exception) { } }
+        }
+    }
+}
+
+/** Reports progress and lets JGit stop quickly when the coroutine is cancelled. */
+private class Mon(val job: Job?, val onStatus: (String) -> Unit, val verb: String) : NullProgressMonitor() {
+    private var total = 0
+    private var done = 0
+    private var lastPct = -1
+    override fun beginTask(title: String?, totalWork: Int) {
+        total = totalWork; done = 0; lastPct = -1
+        onStatus(if (totalWork > 0) "$verb 0%" else "$verb…")
+    }
+
+    override fun update(completed: Int) {
+        done += completed
+        if (total > 0) {
+            val p = (done.toLong() * 100 / total).toInt().coerceIn(0, 100)
+            if (p != lastPct) { lastPct = p; onStatus("$verb $p%") }
+        }
+    }
+
+    override fun isCancelled(): Boolean = job?.isActive == false
+}
+
 /**
  * Real Git through JGit. Commit and Push are separate: a commit is local only and never triggers
  * GitHub Actions; a push may. A rejected push is never forced automatically.
  */
 object GitOps {
     private var inited = false
+    private val lock = Mutex()
+    private const val MAX_FILE = 95 * 1024 * 1024
+
+    /** True while an earlier Git operation is still finishing. */
+    val busy: Boolean get() = lock.isLocked
 
     private fun init() {
         if (inited) return
         inited = true
-        // JGit looks for a home folder and global config; point it at the app's private storage.
         System.setProperty("user.home", App.instance.filesDir.absolutePath)
         try {
             val c = WindowCacheConfig()
             c.setPackedGitMMAP(false)
-            c.setPackedGitLimit(16L * 1024 * 1024)
-            c.setPackedGitWindowSize(1024 * 1024)
-            c.setDeltaBaseCacheLimit(8 * 1024 * 1024)
+            c.setPackedGitLimit(32L * 1024 * 1024)
+            c.setPackedGitWindowSize(2 * 1024 * 1024)
+            c.setDeltaBaseCacheLimit(16 * 1024 * 1024)
             c.install()
         } catch (_: Throwable) {
         }
@@ -69,21 +146,52 @@ object GitOps {
     fun hasWorkflows(root: File): Boolean =
         File(root, ".github/workflows").listFiles()?.any { it.name.endsWith(".yml") || it.name.endsWith(".yaml") } == true
 
+    fun hasCommits(root: File): Boolean =
+        File(root, ".git/packed-refs").exists() || (File(root, ".git/refs/heads").walk().any { it.isFile })
+
+    /** Counts files and bytes (skipping .git and typical build folders) to warn before a huge first push. */
+    suspend fun measure(root: File): Measure = withContext(Dispatchers.IO) {
+        var files = 0
+        var bytes = 0L
+        val stack = ArrayDeque<File>()
+        stack.add(root)
+        while (stack.isNotEmpty() && files < 60_000) {
+            val d = stack.removeLast()
+            for (k in d.listFiles() ?: continue) {
+                if (k.isDirectory) {
+                    if (k.name != ".git" && k.name != "node_modules" && k.name != ".gradle" && k.name != "build") stack.add(k)
+                } else { files++; bytes += k.length() }
+            }
+        }
+        Measure(files, bytes)
+    }
+
     private fun identity(): Pair<String, String> {
         val login = Validate.accountName(Prefs.githubUrl).ifBlank { "gitex" }
         return Prefs.gitName.ifBlank { login } to Prefs.gitEmail.ifBlank { "$login@users.noreply.github.com" }
     }
 
-    private fun creds(): UsernamePasswordCredentialsProvider {
+    private fun creds(link: RepoLink): UsernamePasswordCredentialsProvider {
         val t = Prefs.githubToken() ?: throw IllegalStateException("Not connected to GitHub")
-        return UsernamePasswordCredentialsProvider("x-access-token", t)
+        return UsernamePasswordCredentialsProvider(link.owner.ifBlank { "git" }, t)
+    }
+
+    /** Lock files left behind when the app was closed in the middle of an operation. Safe: operations are serialised. */
+    private fun clearStaleLocks(gitDir: File) {
+        fun walk(d: File, depth: Int) {
+            if (depth > 6) return
+            for (k in d.listFiles() ?: return) {
+                if (k.isDirectory) { if (k.name != "objects" && k.name != "lfs") walk(k, depth + 1) }
+                else if (k.name.endsWith(".lock") || k.name == "gc.pid") k.delete()
+            }
+        }
+        if (gitDir.isDirectory) walk(gitDir, 0)
     }
 
     private fun ensureBranch(git: Git, branch: String) {
         val repo = git.repository
         if (repo.branch == branch) return
         if (repo.resolve("HEAD") == null) {
-            // No commits yet: just point HEAD at the wanted branch name.
             repo.updateRef(Constants.HEAD).link("refs/heads/$branch")
             return
         }
@@ -93,13 +201,23 @@ object GitOps {
 
     private fun openRepo(root: File, link: RepoLink): Git {
         init()
+        clearStaleLocks(File(root, ".git"))
         val git = if (File(root, ".git").exists()) Git.open(root)
         else Git.init().setDirectory(root).setInitialBranch(link.branch).call()
         val repo = git.repository
+        if (repo.repositoryState != RepositoryState.SAFE) {
+            // An unfinished merge from an interrupted run: forget the merge state, keep every file as it is.
+            try { repo.writeMergeHeads(null); repo.writeMergeCommitMsg(null) } catch (_: Throwable) { }
+        }
         val cfg = repo.config
         cfg.setString("remote", "origin", "url", remoteUrl(link))
         cfg.setString("remote", "origin", "fetch", "+refs/heads/*:refs/remotes/origin/*")
-        cfg.setBoolean("core", null, "filemode", false) // shared storage has no executable bit
+        cfg.setBoolean("core", null, "filemode", false)
+        cfg.setInt("core", null, "compression", 1)
+        cfg.setInt("core", null, "loosecompression", 1)
+        cfg.setInt("pack", null, "compression", 1)
+        cfg.setInt("pack", null, "threads", 2)
+        cfg.setBoolean("pack", null, "deltacompression", false)
         cfg.save()
         val ex = File(repo.directory, "info/exclude")
         ex.parentFile?.mkdirs()
@@ -108,10 +226,7 @@ object GitOps {
         return git
     }
 
-    /**
-     * Content of files that are open in the editor but not saved is committed as it is in the editor,
-     * without touching the files on disk.
-     */
+    /** Unsaved editor text is committed as it is in the editor, without touching the files on disk. */
     private fun applyBuffers(repo: Repository, root: File, buffers: Map<String, String>) {
         val dc = repo.lockDirCache()
         try {
@@ -123,7 +238,7 @@ object GitOps {
                 for ((abs, text) in buffers) {
                     if (!abs.startsWith(prefix)) continue
                     val rel = abs.substring(prefix.length).replace(File.separatorChar, '/')
-                    if (dc.findEntry(rel) < 0) continue // ignored or untracked: leave alone
+                    if (dc.findEntry(rel) < 0) continue
                     val bytes = text.toByteArray(Charsets.UTF_8)
                     val id = ins.insert(Constants.OBJ_BLOB, bytes)
                     ed.add(object : DirCacheEditor.PathEdit(rel) {
@@ -145,137 +260,257 @@ object GitOps {
         }
     }
 
-    /** Returns the number of changed files that were committed, or null if there was nothing to commit. */
-    private fun stageAndCommit(git: Git, root: File, message: String, buffers: Map<String, String>): Int? {
+    /** GitHub refuses files over 100 MB: unstage them, exclude them, and report which ones. */
+    private fun excludeHuge(git: Git): List<String> {
+        val repo = git.repository
+        val big = ArrayList<String>()
+        val dc = repo.readDirCache()
+        for (i in 0 until dc.entryCount) {
+            val e = dc.getEntry(i)
+            if (e.length < 0 || e.length > MAX_FILE) big.add(e.pathString)
+        }
+        if (big.isEmpty()) return big
+        val ex = File(repo.directory, "info/exclude")
+        for (p in big) {
+            try { git.rm().setCached(true).addFilepattern(p).call() } catch (_: Throwable) { }
+            try { ex.appendText("\n/$p\n") } catch (_: Throwable) { }
+        }
+        return big
+    }
+
+    private class Staged(val changed: Int, val skipped: List<String>)
+
+    private fun stageAndCommit(git: Git, root: File, message: String, buffers: Map<String, String>, onStatus: (String) -> Unit): Staged? {
+        onStatus("Adding files…")
         git.add().addFilepattern(".").call()
-        git.add().addFilepattern(".").setUpdate(true).call() // also stages deletions
+        git.add().addFilepattern(".").setUpdate(true).call()
         if (buffers.isNotEmpty()) applyBuffers(git.repository, root, buffers)
-        val st = git.status().call()
-        val changed = st.added.size + st.changed.size + st.removed.size
-        if (changed == 0) return null
+        val skipped = excludeHuge(git)
+        onStatus("Committing…")
+        val repo = git.repository
+        val head = repo.resolve("HEAD^{tree}")
+        val dc = repo.readDirCache()
+        val idxTree = repo.newObjectInserter().use { ins -> val id = dc.writeTree(ins); ins.flush(); id }
+        if (head != null && head == idxTree) return null
+        val changed = try {
+            git.diff().setCached(true).setShowNameAndStatusOnly(true).call().size
+        } catch (_: Throwable) {
+            dc.entryCount
+        }
         val (n, e) = identity()
         git.commit().setMessage(message).setAuthor(n, e).setCommitter(n, e).call()
-        return changed
+        return Staged(changed, skipped)
     }
 
     private fun headSha(git: Git): String = git.repository.resolve("HEAD")?.name() ?: ""
 
+    private fun chain(e: Throwable) = generateSequence(e) { it.cause }.take(10).toList()
+
+    private fun detail(e: Throwable): String {
+        val first = e.message.orEmpty()
+        val deepest = chain(e).last().message.orEmpty()
+        return if (deepest.isNotBlank() && deepest != first) "$first: $deepest" else first.ifBlank { e.javaClass.simpleName }
+    }
+
     private fun map(e: Throwable): GitResult {
-        val chain = generateSequence(e) { it.cause }.take(8).toList()
-        val msg = chain.mapNotNull { it.message }.joinToString(" | ")
+        val ch = chain(e)
+        val msg = ch.mapNotNull { it.message }.joinToString(" | ")
         return when {
-            chain.any { it is UnknownHostException || it is ConnectException || it is SocketTimeoutException || it is SocketException } ->
+            ch.any { it is UnknownHostException || it is ConnectException || it is SocketTimeoutException || it is SocketException } ->
                 GitResult.Offline("Couldn't reach GitHub. Check your internet connection.")
+            ch.any { it is NoRemoteRepositoryException } || msg.contains("repository not found", true) ->
+                GitResult.NotFound(detail(e))
             msg.contains("not authorized", true) || msg.contains("Authentication", true) ||
                 msg.contains("401") || msg.contains("403") ->
                 GitResult.AuthFailed("GitHub didn't accept your sign-in, or your account can't write to this repository. Reconnect in Settings → GitHub.")
-            msg.contains("not found", true) || msg.contains("404") ->
-                GitResult.NotFound("GitHub can't find this repository. Create it on github.com first, or check the name in Repo Name & Branch.")
-            chain.any { it is CheckoutConflictException } ->
+            ch.any { it is CheckoutConflictException } ->
                 GitResult.Failed("Switching branch would overwrite local changes. Commit them first.")
-            else -> GitResult.Failed(e.message ?: e.javaClass.simpleName)
+            else -> GitResult.Failed(detail(e))
         }
     }
 
-    suspend fun commit(root: File, link: RepoLink, message: String, buffers: Map<String, String>): GitResult =
-        withContext(Dispatchers.IO) {
-            try {
-                openRepo(root, link).use { git ->
-                    val n = stageAndCommit(git, root, message, buffers)
-                    if (n == null) GitResult.NothingToCommit else GitResult.Committed(headSha(git), n)
-                }
-            } catch (e: Throwable) {
-                if (e is CancellationException) throw e
-                map(e)
-            }
+    /** When Git says "not found", ask GitHub's API what is really wrong so the message is exact. */
+    private suspend fun diagnose(link: RepoLink, raw: String): GitResult {
+        val t = Prefs.githubToken() ?: return GitResult.AuthFailed("Connect your GitHub account first.")
+        val r = try {
+            Http.request(
+                "GET", "https://api.github.com/repos/${link.owner}/${link.repo}",
+                mapOf("Authorization" to "Bearer $t", "Accept" to "application/vnd.github+json")
+            )
+        } catch (e: Exception) {
+            return GitResult.Offline(Http.describe(e))
         }
-
-    /** Commits whatever changed, then pushes the branch. With [force] the remote branch is overwritten (only after explicit confirmation). */
-    suspend fun push(root: File, link: RepoLink, message: String, buffers: Map<String, String>, force: Boolean = false): GitResult =
-        withContext(Dispatchers.IO) {
-            try {
-                openRepo(root, link).use { git ->
-                    stageAndCommit(git, root, message, buffers)
-                    if (git.repository.resolve("HEAD") == null) {
-                        return@use GitResult.Failed("This project has no files to commit yet.")
-                    }
-                    val b = link.branch
-                    val spec = RefSpec("refs/heads/$b:refs/heads/$b").setForceUpdate(force)
-                    val results = git.push().setRemote("origin").setRefSpecs(spec).setForce(force)
-                        .setCredentialsProvider(creds()).setTimeout(45).call()
-                    var upToDate = false
-                    var ok = false
-                    for (r in results) {
-                        val server = r.messages.orEmpty().trim()
-                        for (u in r.remoteUpdates) {
-                            when (u.status) {
-                                RemoteRefUpdate.Status.OK -> ok = true
-                                RemoteRefUpdate.Status.UP_TO_DATE -> upToDate = true
-                                RemoteRefUpdate.Status.REJECTED_NONFASTFORWARD,
-                                RemoteRefUpdate.Status.REJECTED_REMOTE_CHANGED ->
-                                    return@use GitResult.Rejected("GitHub has commits this phone doesn't have yet.", true)
-                                RemoteRefUpdate.Status.REJECTED_OTHER_REASON ->
-                                    return@use GitResult.Rejected(
-                                        (u.message ?: server).ifBlank { "GitHub rejected the push (for example a protected branch)." }, false
-                                    )
-                                else -> return@use GitResult.Failed("Push didn't complete (${u.status}). ${u.message ?: server}".trim())
-                            }
-                        }
-                    }
-                    if (ok || upToDate) GitResult.Pushed(headSha(git), upToDate && !ok)
-                    else GitResult.Failed("GitHub didn't confirm the push.")
-                }
-            } catch (e: Throwable) {
-                if (e is CancellationException) throw e
-                map(e)
+        return when (r.code) {
+            200 -> {
+                val canPush = try { JSONObject(r.body).optJSONObject("permissions")?.optBoolean("push", true) ?: true } catch (_: Exception) { true }
+                if (!canPush) GitResult.AuthFailed("Your account can see ${link.owner}/${link.repo} but has no write access to it.")
+                else GitResult.Failed("GitHub has ${link.owner}/${link.repo}, but refused the Git connection ($raw). Try disconnecting and reconnecting GitHub in Settings → GitHub.")
             }
-        }
-
-    /** Fetches and returns how many commits exist on GitHub's branch that are missing locally. */
-    suspend fun remoteAheadCount(root: File, link: RepoLink): Result<Int> = withContext(Dispatchers.IO) {
-        try {
-            openRepo(root, link).use { git ->
-                git.fetch().setRemote("origin").setCredentialsProvider(creds()).setTimeout(45).call()
-                val repo = git.repository
-                val remote = repo.resolve("refs/remotes/origin/${link.branch}") ?: return@use Result.success(0)
-                val local = repo.resolve("refs/heads/${link.branch}")
-                val cmd = git.log().add(remote).setMaxCount(500)
-                if (local != null) cmd.not(local)
-                Result.success(cmd.call().count())
-            }
-        } catch (e: Throwable) {
-            if (e is CancellationException) throw e
-            Result.failure(e)
+            404 -> GitResult.NotFound("GitHub can't find \"${link.owner}/${link.repo}\" for your account. Check the repository name in Repo Name & Branch (the owner comes from your GitHub URL in Settings).")
+            401 -> GitResult.AuthFailed("Your GitHub sign-in expired. Reconnect in Settings → GitHub.")
+            else -> GitResult.Failed("GitHub answered HTTP ${r.code} while checking the repository.")
         }
     }
 
-    /**
-     * Brings GitHub's commits into the local branch. If they conflict with local work the merge is undone
-     * and nothing is changed. Save open files first.
-     */
-    suspend fun fetchAndMerge(root: File, link: RepoLink): MergeOutcome = withContext(Dispatchers.IO) {
+    private suspend fun finish(e: Throwable, job: Job?, link: RepoLink): GitResult {
+        if (job?.isActive == false) throw CancellationException("cancelled")
+        if (e is CancellationException) throw e
+        val r = map(e)
+        return if (r is GitResult.NotFound) diagnose(link, r.detail) else r
+    }
+
+    // ---- commit ----
+
+    suspend fun commit(
+        root: File, link: RepoLink, message: String, buffers: Map<String, String>,
+        onStatus: (String) -> Unit = {},
+    ): GitResult = withContext(Dispatchers.IO) {
+        val job = coroutineContext[Job]
+        if (lock.isLocked) onStatus("Finishing the previous operation…")
+        lock.withLock {
+            try {
+                val git = openRepo(root, link)
+                try {
+                    val s = stageAndCommit(git, root, message, buffers, onStatus)
+                    if (s == null) GitResult.NothingToCommit else GitResult.Committed(headSha(git), s.changed, s.skipped)
+                } finally {
+                    git.close()
+                }
+            } catch (e: Throwable) {
+                finish(e, job, link)
+            }
+        }
+    }
+
+    // ---- push ----
+
+    private fun remoteTip(link: RepoLink, job: Job?): ObjectId? {
+        val refs = Git.lsRemoteRepository().setRemote(remoteUrl(link)).setHeads(true)
+            .setCredentialsProvider(creds(link)).setTimeout(30).callAsMap()
+        if (job?.isActive == false) throw CancellationException("cancelled")
+        return refs["refs/heads/${link.branch}"]?.objectId
+    }
+
+    private fun pushBlocking(
+        root: File, link: RepoLink, message: String, buffers: Map<String, String>,
+        force: Boolean, onStatus: (String) -> Unit, job: Job?,
+    ): GitResult {
+        val git = openRepo(root, link)
         try {
-            openRepo(root, link).use { git ->
-                git.fetch().setRemote("origin").setCredentialsProvider(creds()).setTimeout(45).call()
-                val repo = git.repository
-                val remote = repo.resolve("refs/remotes/origin/${link.branch}") ?: return@use MergeOutcome.NoRemoteBranch
-                val before = repo.resolve("HEAD") ?: return@use MergeOutcome.Failed("There is nothing local to merge into.")
-                val res = git.merge().include(remote).setFastForward(MergeCommand.FastForwardMode.FF)
-                    .setCommit(true).setMessage("Merge remote changes from GitHub").call()
-                val status = res.mergeStatus
-                when {
-                    status.toString() == "ALREADY_UP_TO_DATE" -> MergeOutcome.UpToDate
-                    status.isSuccessful -> MergeOutcome.Merged
-                    else -> {
-                        val files = res.conflicts?.keys?.toList().orEmpty()
-                        try { git.reset().setMode(ResetCommand.ResetType.HARD).setRef(before.name()).call() } catch (_: Throwable) { }
-                        if (files.isNotEmpty()) MergeOutcome.Conflicts(files) else MergeOutcome.Failed("The merge couldn't be completed ($status).")
+            // Fast check first: if GitHub already has commits we don't have, say so now, before any heavy work.
+            onStatus("Contacting GitHub…")
+            val tip = remoteTip(link, job)
+            if (!force && tip != null && !git.repository.objectDatabase.has(tip)) {
+                return GitResult.Rejected("GitHub has commits this phone doesn't have yet.", true)
+            }
+            val staged = stageAndCommit(git, root, message, buffers, onStatus)
+            if (git.repository.resolve("HEAD") == null) return GitResult.Failed("This project has no files to commit yet.")
+            onStatus("Uploading…")
+            val b = link.branch
+            val spec = RefSpec("refs/heads/$b:refs/heads/$b").setForceUpdate(force)
+            val results = git.push().setRemote("origin").setRefSpecs(spec).setForce(force)
+                .setCredentialsProvider(creds(link)).setTimeout(60)
+                .setProgressMonitor(Mon(job, onStatus, "Uploading")).call()
+            var upToDate = false
+            var ok = false
+            for (r in results) {
+                val server = r.messages.orEmpty().trim()
+                for (u in r.remoteUpdates) {
+                    when (u.status) {
+                        RemoteRefUpdate.Status.OK -> ok = true
+                        RemoteRefUpdate.Status.UP_TO_DATE -> upToDate = true
+                        RemoteRefUpdate.Status.REJECTED_NONFASTFORWARD,
+                        RemoteRefUpdate.Status.REJECTED_REMOTE_CHANGED ->
+                            return GitResult.Rejected("GitHub has commits this phone doesn't have yet.", true)
+                        RemoteRefUpdate.Status.REJECTED_OTHER_REASON ->
+                            return GitResult.Rejected(
+                                (u.message ?: server).ifBlank { "GitHub rejected the push (for example a protected branch)." }, false
+                            )
+                        else -> return GitResult.Failed("Push didn't complete (${u.status}). ${u.message ?: server}".trim())
                     }
                 }
             }
-        } catch (e: Throwable) {
-            if (e is CancellationException) throw e
-            MergeOutcome.Failed((map(e) as? GitResult.Failed)?.detail ?: e.message ?: "Merge failed")
+            val skipped = staged?.skipped ?: emptyList()
+            return if (ok || upToDate) GitResult.Pushed(headSha(git), upToDate && !ok, skipped)
+            else GitResult.Failed("GitHub didn't confirm the push.")
+        } finally {
+            git.close()
+        }
+    }
+
+    /** Commits whatever changed, then pushes the branch (creating it on GitHub if needed). [force] only after explicit confirmation. */
+    suspend fun push(
+        root: File, link: RepoLink, message: String, buffers: Map<String, String>,
+        force: Boolean = false, onStatus: (String) -> Unit = {},
+    ): GitResult = withContext(Dispatchers.IO) {
+        val job = coroutineContext[Job]
+        if (lock.isLocked) onStatus("Finishing the previous operation…")
+        lock.withLock {
+            try {
+                pushBlocking(root, link, message, buffers, force, onStatus, job)
+            } catch (e: Throwable) {
+                finish(e, job, link)
+            }
+        }
+    }
+
+    // ---- merge ----
+
+    private fun mergeBlocking(
+        root: File, link: RepoLink, message: String, buffers: Map<String, String>,
+        onStatus: (String) -> Unit, job: Job?,
+    ): MergeOutcome {
+        val git = openRepo(root, link)
+        try {
+            // Commit local work first, so that undoing a failed merge can never lose an edit.
+            stageAndCommit(git, root, message, buffers, onStatus)
+            onStatus("Fetching from GitHub…")
+            git.fetch().setRemote("origin").setCredentialsProvider(creds(link)).setTimeout(60)
+                .setProgressMonitor(Mon(job, onStatus, "Fetching")).call()
+            val repo = git.repository
+            val remote = repo.resolve("refs/remotes/origin/${link.branch}") ?: return MergeOutcome.NoRemoteBranch
+            val before = repo.resolve("HEAD") ?: return MergeOutcome.Failed("There is nothing local to merge into.")
+            onStatus("Merging…")
+            val res = git.merge().include(remote).setFastForward(MergeCommand.FastForwardMode.FF)
+                .setCommit(true).setMessage("Merge remote changes from GitHub").call()
+            val status = res.mergeStatus
+            return when {
+                status.toString() == "ALREADY_UP_TO_DATE" -> MergeOutcome.UpToDate
+                status.isSuccessful -> MergeOutcome.Merged
+                else -> {
+                    val files = res.conflicts?.keys?.toList().orEmpty()
+                    try { git.reset().setMode(ResetCommand.ResetType.HARD).setRef(before.name()).call() } catch (_: Throwable) { }
+                    if (files.isNotEmpty()) MergeOutcome.Conflicts(files) else MergeOutcome.Failed("The merge couldn't be completed ($status).")
+                }
+            }
+        } finally {
+            git.close()
+        }
+    }
+
+    /** Brings GitHub's commits into the local branch. On conflict everything is put back exactly as it was. */
+    suspend fun fetchAndMerge(
+        root: File, link: RepoLink, message: String, buffers: Map<String, String>,
+        onStatus: (String) -> Unit = {},
+    ): MergeOutcome = withContext(Dispatchers.IO) {
+        val job = coroutineContext[Job]
+        if (lock.isLocked) onStatus("Finishing the previous operation…")
+        lock.withLock {
+            try {
+                mergeBlocking(root, link, message, buffers, onStatus, job)
+            } catch (e: Throwable) {
+                if (job?.isActive == false) throw CancellationException("cancelled")
+                if (e is CancellationException) throw e
+                MergeOutcome.Failed(
+                    when (val r = map(e)) {
+                        is GitResult.Offline -> r.detail
+                        is GitResult.AuthFailed -> r.detail
+                        is GitResult.NotFound -> r.detail
+                        is GitResult.Failed -> r.detail
+                        else -> detail(e)
+                    }
+                )
+            }
         }
     }
 }
