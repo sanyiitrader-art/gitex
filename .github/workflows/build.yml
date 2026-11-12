@@ -1,15 +1,12 @@
 name: Build Gitex APK
 
-# Manual only while developing: commit as many files as you like, then press
-# Actions → "Build Gitex APK" → Run workflow.
-# Later, when Gitex itself pushes your changes, replace this block with:
-#   on:
-#     push:
-#       branches: ["**"]
-#       paths-ignore: ["**.md"]
-#     workflow_dispatch:
-# (A commit message containing [skip ci] also skips automatic runs.)
+# Gitex pushes its commits with the message "Update from Gitex" and follows the run that
+# starts for them. Commits made any other way (for example in GitHub's own editor) do NOT
+# start a build: the job below is skipped for them. Start a build by hand with
+# Actions -> "Build Gitex APK" -> Run workflow whenever you want one.
 on:
+  push:
+    branches: ["**"]
   workflow_dispatch:
 
 concurrency:
@@ -21,6 +18,8 @@ permissions:
 
 jobs:
   build:
+    # Manual runs always build; pushes build only when they come from Gitex.
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, 'Update from Gitex')
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
