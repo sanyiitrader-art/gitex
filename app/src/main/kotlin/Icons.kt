@@ -1,708 +1,81 @@
 package app.gitex
 
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.defaultMinSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.layout.size
+import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.lerp
-import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.graphics.vector.PathParser
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.viewinterop.AndroidView
-import io.github.rosemoe.sora.event.ContentChangeEvent
-import io.github.rosemoe.sora.event.SelectionChangeEvent
-import io.github.rosemoe.sora.lang.EmptyLanguage
-import io.github.rosemoe.sora.lang.analysis.AnalyzeManager
-import io.github.rosemoe.sora.lang.analysis.SimpleAnalyzeManager
-import io.github.rosemoe.sora.lang.analysis.StyleReceiver
-import io.github.rosemoe.sora.lang.styling.CodeBlock
-import io.github.rosemoe.sora.lang.styling.MappedSpans
-import io.github.rosemoe.sora.lang.styling.Styles
-import io.github.rosemoe.sora.lang.styling.TextStyle
-import io.github.rosemoe.sora.text.Content
-import io.github.rosemoe.sora.widget.CodeEditor
-import io.github.rosemoe.sora.widget.schemes.EditorColorScheme
-import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicInteger
 
-// ---------------------------------------------------------------------------
-// Small reflection helpers. Sora's cosmetic setters and colour-id constants have
-// moved between 0.2x releases, so optional tweaks go through these and can never
-// break the build. (proguard-rules.pro keeps Sora's names so this works in release.)
-// ---------------------------------------------------------------------------
+private fun vec(name: String, d: String, vp: Float = 24f): ImageVector =
+    ImageVector.Builder(name, 24.dp, 24.dp, vp, vp).addPath(
+        pathData = PathParser().parsePathString(d).toNodes(),
+        fill = SolidColor(Color.Black)
+    ).build()
 
-private fun coerce(v: Any, t: Class<*>): Any = when (t) {
-    Int::class.javaPrimitiveType, Int::class.javaObjectType -> (v as Number).toInt()
-    Float::class.javaPrimitiveType, Float::class.javaObjectType -> (v as Number).toFloat()
-    Long::class.javaPrimitiveType, Long::class.javaObjectType -> (v as Number).toLong()
-    else -> v
-}
+private fun lz(name: String, d: String, vp: Float = 24f) = lazy { vec(name, d, vp) }
 
-private fun poke(target: Any?, name: String, value: Any) {
-    if (target == null) return
-    val setter = "set" + name.replaceFirstChar { it.uppercase() }
-    try {
-        for (m in target.javaClass.methods) {
-            if (m.name == setter && m.parameterTypes.size == 1) {
-                m.invoke(target, coerce(value, m.parameterTypes[0]))
-                return
-            }
-        }
-        val f = target.javaClass.getField(name)
-        f.set(target, coerce(value, f.type))
-    } catch (_: Throwable) {
-    }
-}
+/** All UI icons as vector paths (24x24 unless noted). Built lazily, tinted at draw time. */
+object Ico {
+    val Menu by lz("menu", "M3,18h18v-2L3,16v2zM3,13h18v-2L3,11v2zM3,6v2h18L21,6L3,6z")
+    val Close by lz("close", "M19,6.41L17.59,5 12,10.59 6.41,5 5,6.41 10.59,12 5,17.59 6.41,19 12,13.41 17.59,19 19,17.59 13.41,12z")
+    val ArrowDown by lz("arrow_down", "M7.41,8.59L12,13.17l4.59,-4.58L18,10l-6,6 -6,-6 1.41,-1.41z")
+    val ArrowUp by lz("arrow_up", "M7.41,15.41L12,10.83l4.59,4.58L18,14l-6,-6 -6,6z")
+    val ChevronRight by lz("chevron_right", "M10,6L8.59,7.41 13.17,12l-4.58,4.59L10,18l6,-6z")
+    val MoreVert by lz("more_vert", "M12,8c1.1,0 2,-0.9 2,-2s-0.9,-2 -2,-2 -2,0.9 -2,2 0.9,2 2,2zM12,10c-1.1,0 -2,0.9 -2,2s0.9,2 2,2 2,-0.9 2,-2 -0.9,-2 -2,-2zM12,16c-1.1,0 -2,0.9 -2,2s0.9,2 2,2 2,-0.9 2,-2 -0.9,-2 -2,-2z")
+    val Search by lz("search", "M15.5,14h-0.79l-0.28,-0.27C15.41,12.59 16,11.11 16,9.5 16,5.91 13.09,3 9.5,3S3,5.91 3,9.5 5.91,16 9.5,16c1.61,0 3.09,-0.59 4.23,-1.57l0.27,0.28v0.79l5,4.99L20.49,19l-4.99,-5zM9.5,14C7.01,14 5,11.99 5,9.5S7.01,5 9.5,5 14,7.01 14,9.5 11.99,14 9.5,14z")
+    val Back by lz("back", "M20,11H7.83l5.59,-5.59L12,4l-8,8 8,8 1.41,-1.41L7.83,13H20v-2z")
+    val Add by lz("add", "M19,13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z")
+    val Check by lz("check", "M9,16.17L4.83,12l-1.42,1.41L9,19 21,7l-1.41,-1.41z")
+    val Copy by lz("copy", "M16,1L4,1c-1.1,0 -2,0.9 -2,2v14h2L4,3h12L16,1zM19,5L8,5c-1.1,0 -2,0.9 -2,2v14c0,1.1 0.9,2 2,2h11c1.1,0 2,-0.9 2,-2L21,7c0,-1.1 -0.9,-2 -2,-2zM19,21L8,21L8,7h11v14z")
+    val Delete by lz("delete", "M6,19c0,1.1 0.9,2 2,2h8c1.1,0 2,-0.9 2,-2V7H6v12zM19,4h-3.5l-1,-1h-5l-1,1H5v2h14V4z")
+    val Gear by lz("gear", "M19.14,12.94c0.04,-0.3 0.06,-0.61 0.06,-0.94c0,-0.32 -0.02,-0.64 -0.07,-0.94l2.03,-1.58c0.18,-0.14 0.23,-0.41 0.12,-0.61l-1.92,-3.32c-0.12,-0.22 -0.37,-0.29 -0.59,-0.22l-2.39,0.96c-0.5,-0.38 -1.03,-0.7 -1.62,-0.94L14.4,2.81c-0.04,-0.24 -0.24,-0.41 -0.48,-0.41h-3.84c-0.24,0 -0.43,0.17 -0.47,0.41L9.25,5.35C8.66,5.59 8.12,5.92 7.63,6.29L5.24,5.33c-0.22,-0.08 -0.47,0 -0.59,0.22L2.74,8.87C2.62,9.08 2.66,9.34 2.86,9.48l2.03,1.58C4.84,11.36 4.8,11.69 4.8,12s0.02,0.64 0.07,0.94l-2.03,1.58c-0.18,0.14 -0.23,0.41 -0.12,0.61l1.92,3.32c0.12,0.22 0.37,0.29 0.59,0.22l2.39,-0.96c0.5,0.38 1.03,0.7 1.62,0.94l0.36,2.54c0.05,0.24 0.24,0.41 0.48,0.41h3.84c0.24,0 0.44,-0.17 0.47,-0.41l0.36,-2.54c0.59,-0.24 1.13,-0.56 1.62,-0.94l2.39,0.96c0.22,0.08 0.47,0 0.59,-0.22l1.92,-3.32c0.12,-0.22 0.07,-0.47 -0.12,-0.61L19.14,12.94zM12,15.6c-1.98,0 -3.6,-1.62 -3.6,-3.6s1.62,-3.6 3.6,-3.6s3.6,1.62 3.6,3.6S13.98,15.6 12,15.6z")
+    val Wrench by lz("wrench", "M22.7,19l-9.1,-9.1c0.9,-2.3 0.4,-5 -1.5,-6.9 -2,-2 -5,-2.4 -7.4,-1.3L9,6 6,9 1.6,4.7C0.4,7.1 0.9,10.1 2.9,12.1c1.9,1.9 4.6,2.4 6.9,1.5l9.1,9.1c0.4,0.4 1,0.4 1.4,0l2.3,-2.3c0.5,-0.4 0.5,-1.1 0.1,-1.4z")
+    val Palette by lz("palette", "M12,3c-4.97,0 -9,4.03 -9,9s4.03,9 9,9c0.83,0 1.5,-0.67 1.5,-1.5 0,-0.39 -0.15,-0.74 -0.39,-1.01 -0.23,-0.26 -0.38,-0.61 -0.38,-0.99 0,-0.83 0.67,-1.5 1.5,-1.5L16,16c2.76,0 5,-2.24 5,-5 0,-4.42 -4.03,-8 -9,-8zM6.5,12c-0.83,0 -1.5,-0.67 -1.5,-1.5S5.67,9 6.5,9 8,9.67 8,10.5 7.33,12 6.5,12zM9.5,8C8.67,8 8,7.33 8,6.5S8.67,5 9.5,5s1.5,0.67 1.5,1.5S10.33,8 9.5,8zM14.5,8c-0.83,0 -1.5,-0.67 -1.5,-1.5S13.67,5 14.5,5s1.5,0.67 1.5,1.5S15.33,8 14.5,8zM17.5,12c-0.83,0 -1.5,-0.67 -1.5,-1.5S16.67,9 17.5,9s1.5,0.67 1.5,1.5 -0.67,1.5 -1.5,1.5z")
+    val Github by lz("github", "M8,0C3.58,0 0,3.58 0,8c0,3.54 2.29,6.53 5.47,7.59 0.4,0.07 0.55,-0.17 0.55,-0.38 0,-0.19 -0.01,-0.82 -0.01,-1.49 -2.01,0.37 -2.53,-0.49 -2.69,-0.94 -0.09,-0.23 -0.48,-0.94 -0.82,-1.13 -0.28,-0.15 -0.68,-0.52 -0.01,-0.53 0.63,-0.01 1.08,0.58 1.23,0.82 0.72,1.21 1.87,0.87 2.33,0.66 0.07,-0.52 0.28,-0.87 0.51,-1.07 -1.78,-0.2 -3.64,-0.89 -3.64,-3.95 0,-0.87 0.31,-1.59 0.82,-2.15 -0.08,-0.2 -0.36,-1.02 0.08,-2.12 0,0 0.67,-0.21 2.2,0.82 0.64,-0.18 1.32,-0.27 2,-0.27 0.68,0 1.36,0.09 2,0.27 1.53,-1.04 2.2,-0.82 2.2,-0.82 0.44,1.1 0.16,1.92 0.08,2.12 0.51,0.56 0.82,1.27 0.82,2.15 0,3.07 -1.87,3.75 -3.65,3.95 0.29,0.25 0.54,0.73 0.54,1.48 0,1.07 -0.01,1.93 -0.01,2.2 0,0.21 0.15,0.46 0.55,0.38A8.013,8.013 0 0 0 16,8c0,-4.42 -3.58,-8 -8,-8z", 16f)
+    val Pencil by lz("pencil", "M3,17.25V21h3.75L17.81,9.94l-3.75,-3.75L3,17.25zM20.71,7.04c0.39,-0.39 0.39,-1.02 0,-1.41l-2.34,-2.34c-0.39,-0.39 -1.02,-0.39 -1.41,0l-1.83,1.83 3.75,3.75 1.83,-1.83z")
+    val Undo by lz("undo", "M12.5,8c-2.65,0 -5.05,0.99 -6.9,2.6L2,7v9h9l-3.62,-3.62c1.39,-1.16 3.16,-1.88 5.12,-1.88 3.54,0 6.55,2.31 7.6,5.5l2.37,-0.78C21.08,11.03 17.15,8 12.5,8z")
+    val Redo by lz("redo", "M18.4,10.6C16.55,8.99 14.15,8 11.5,8c-4.65,0 -8.58,3.03 -9.96,7.22L3.9,16c1.05,-3.19 4.05,-5.5 7.6,-5.5 1.95,0 3.73,0.72 5.12,1.88L13,16h9V7l-3.6,3.6z")
+    val Download by lz("download", "M19,9h-4V3H9v6H5l7,7 7,-7zM5,18v2h14v-2H5z")
+    val Warning by lz("warning", "M1,21h22L12,2 1,21zM13,18h-2v-2h2v2zM13,14h-2v-4h2v4z")
+    val Refresh by lz("refresh", "M17.65,6.35C16.2,4.9 14.21,4 12,4c-4.42,0 -7.99,3.58 -7.99,8s3.57,8 7.99,8c3.73,0 6.84,-2.55 7.73,-6h-2.08c-0.82,2.33 -3.04,4 -5.65,4 -3.31,0 -6,-2.69 -6,-6s2.69,-6 6,-6c1.66,0 3.14,0.69 4.22,1.78L13,11h7V4l-2.35,2.35z")
+    val Folder by lz("folder", "M10,4H4c-1.1,0 -1.99,0.9 -1.99,2L2,18c0,1.1 0.9,2 2,2h16c1.1,0 2,-0.9 2,-2V8c0,-1.1 -0.9,-2 -2,-2h-8l-2,-2z")
+    val File by lz("file", "M14,2H6c-1.1,0 -1.99,0.9 -1.99,2L4,20c0,1.1 0.89,2 1.99,2H18c1.1,0 2,-0.9 2,-2V8l-6,-6zM16,18H8v-2h8v2zM16,14H8v-2h8v2zM13,9V3.5L18.5,9H13z")
+    val Image by lz("image", "M21,19V5c0,-1.1 -0.9,-2 -2,-2H5c-1.1,0 -2,0.9 -2,2v14c0,1.1 0.9,2 2,2h14c1.1,0 2,-0.9 2,-2zM8.5,13.5l2.5,3.01L14.5,12l4.5,6H5l3.5,-4.5z")
+    val Eye by lz("eye", "M12,4.5C7,4.5 2.73,7.61 1,12c1.73,4.39 6,7.5 11,7.5s9.27,-3.11 11,-7.5c-1.73,-4.39 -6,-7.5 -11,-7.5zM12,17c-2.76,0 -5,-2.24 -5,-5s2.24,-5 5,-5 5,2.24 5,5 -2.24,5 -5,5zM12,9c-1.66,0 -3,1.34 -3,3s1.34,3 3,3 3,-1.34 3,-3 -1.34,-3 -3,-3z")
+    val CheckOn by lz("check_on", "M19,3H5c-1.11,0 -2,0.9 -2,2v14c0,1.1 0.89,2 2,2h14c1.11,0 2,-0.9 2,-2V5c0,-1.1 -0.89,-2 -2,-2zM10,17l-5,-5 1.41,-1.41L10,14.17l7.59,-7.59L19,8l-9,9z")
+    val CheckOff by lz("check_off", "M19,5v14H5V5h14m0,-2H5c-1.1,0 -2,0.9 -2,2v14c0,1.1 0.9,2 2,2h14c1.1,0 2,-0.9 2,-2V5c0,-1.1 -0.9,-2 -2,-2z")
 
-private fun callNoArg(target: Any?, name: String) {
-    try {
-        target?.javaClass?.getMethod(name)?.invoke(target)
-    } catch (_: Throwable) {
-    }
-}
-
-private fun schemeId(name: String): Int = try {
-    EditorColorScheme::class.java.getField(name).getInt(null)
-} catch (_: Throwable) {
-    -1
-}
-
-private fun setScheme(cs: EditorColorScheme, name: String, argb: Int) {
-    val id = schemeId(name)
-    if (id >= 0) try { cs.setColor(id, argb) } catch (_: Throwable) { }
-}
-
-// ---------------------------------------------------------------------------
-// Highlighting, bracket pairs and indentation guides
-// ---------------------------------------------------------------------------
-
-private class SpanData {
-    var line = IntArray(256)
-    var col = IntArray(256)
-    var kind = ByteArray(256)
-    var n = 0
-    fun add(l: Int, c: Int, k: Int) {
-        if (n == line.size) {
-            line = line.copyOf(n * 2); col = col.copyOf(n * 2); kind = kind.copyOf(n * 2)
-        }
-        line[n] = l; col[n] = c; kind[n] = k.toByte(); n++
-    }
-}
-
-private class BracketData(val line: IntArray, val col: IntArray, val match: IntArray) {
-    /** Index of the bracket at exactly (l, c), or -1. Entries are sorted by position. */
-    fun find(l: Int, c: Int): Int {
-        if (c < 0) return -1
-        var lo = 0
-        var hi = line.size - 1
-        val key = (l.toLong() shl 32) or c.toLong()
-        while (lo <= hi) {
-            val mid = (lo + hi) ushr 1
-            val k = (line[mid].toLong() shl 32) or col[mid].toLong()
-            if (k < key) lo = mid + 1 else if (k > key) hi = mid - 1 else return mid
-        }
-        return -1
-    }
-}
-
-private val styleExec = Executors.newSingleThreadExecutor { r -> Thread(r, "gitex-style").apply { isDaemon = true } }
-
-private val receiverField = try {
-    SimpleAnalyzeManager::class.java.getDeclaredField("receiver").also { it.isAccessible = true }
-} catch (_: Throwable) {
-    null
-}
-
-class LexAnalyzer(
-    private val lang: LangDef?,
-    tokenIds: IntArray,
-    bracketFgId: Int,
-    bracketBgId: Int,
-    private val highlight: Boolean,
-    private val guides: Boolean,
-    private val bracketsOn: Boolean,
-    private val indentW: Int,
-) : SimpleAnalyzeManager<Any>() {
-
-    private val tok = LongArray(Tok.COUNT) { TextStyle.makeStyle(tokenIds[it]) }
-    private val bracketStyle = TextStyle.makeStyle(bracketFgId, bracketBgId, true, false, false, false)
-
-    @Volatile private var data: SpanData? = null
-    @Volatile private var brackets: BracketData? = null
-    @Volatile private var blocks: List<CodeBlock> = emptyList()
-    @Volatile private var lineCount = 1
-    private val ticket = AtomicInteger()
-    private var lastPair = -1L
-
-    private fun currentReceiver(): StyleReceiver? = try {
-        receiverField?.get(this) as? StyleReceiver
-    } catch (_: Throwable) {
-        null
-    }
-
-    override fun analyze(text: StringBuilder, delegate: SimpleAnalyzeManager<Any>.Delegate<Any>): Styles {
-        val cancelM = try { delegate.javaClass.getMethod("isCancelled") } catch (_: Throwable) { null }
-        val cancelled = { try { (cancelM?.invoke(delegate) as? Boolean) ?: false } catch (_: Throwable) { false } }
-
-        val d = SpanData()
-        val l = lang
-        if (highlight && l != null) {
-            Lexer.run(text, l, cancelled) { line, col, kind -> d.add(line, col, kind) }
-        }
-        if (d.n == 0) d.add(0, 0, Tok.PLAIN)
-        var lines = 1
-        for (i in 0 until text.length) if (text[i] == '\n') lines++
-        lineCount = lines
-        data = d
-        brackets = if (bracketsOn && highlight && l != null) findBrackets(text, d) else null
-        blocks = if (guides) computeBlocks(text) else emptyList()
-        lastPair = -1L
-        return build(d, -1L, -1L)
-    }
-
-    private fun pack(line: Int, col: Int) = (line.toLong() shl 32) or col.toLong()
-
-    private fun build(d: SpanData, a: Long, b: Long): Styles {
-        val mb = MappedSpans.Builder()
-        val aL = if (a >= 0) (a shr 32).toInt() else -1
-        val aC = if (a >= 0) (a and 0xFFFFFFFFL).toInt() else -1
-        val bL = if (b >= 0) (b shr 32).toInt() else -1
-        val bC = if (b >= 0) (b and 0xFFFFFFFFL).toInt() else -1
-        for (i in 0 until d.n) {
-            val line = d.line[i]
-            val col = d.col[i]
-            val k = d.kind[i].toInt()
-            val st = tok[k]
-            if (k == Tok.PLAIN && (line == aL || line == bL)) {
-                val end = if (i + 1 < d.n && d.line[i + 1] == line) d.col[i + 1] else Int.MAX_VALUE
-                var c1 = -1
-                var c2 = -1
-                if (line == aL && aC >= col && aC < end) c1 = aC
-                if (line == bL && bC >= col && bC < end) { if (c1 < 0) c1 = bC else c2 = bC }
-                if (c2 in 0 until c1) { val t = c1; c1 = c2; c2 = t }
-                if (c1 < 0) {
-                    mb.addIfNeeded(line, col, st)
-                } else {
-                    var pos = col
-                    for (pc in intArrayOf(c1, c2)) {
-                        if (pc < 0) continue
-                        if (pc > pos) mb.addIfNeeded(line, pos, st)
-                        mb.addIfNeeded(line, pc, bracketStyle)
-                        pos = pc + 1
-                    }
-                    mb.addIfNeeded(line, pos, st)
-                }
-            } else {
-                mb.addIfNeeded(line, col, st)
-            }
-        }
-        mb.determine(lineCount - 1)
-        val styles = Styles(mb.build())
-        val bl = blocks
-        if (bl.isNotEmpty()) poke(styles, "blocks", ArrayList(bl))
-        callNoArg(styles, "finishBuilding")
-        return styles
-    }
-
-    /** Call when the caret moves. line < 0 clears the highlight. Cheap: runs on a background thread. */
-    fun update(line: Int, col: Int) {
-        val br = brackets ?: return
-        val d = data ?: return
-        val req = ticket.incrementAndGet()
-        styleExec.execute {
-            if (ticket.get() != req) return@execute
-            var idx = if (line >= 0) br.find(line, col - 1) else -1
-            if (idx < 0 && line >= 0) idx = br.find(line, col)
-            val m = if (idx >= 0) br.match[idx] else -1
-            val key = if (m >= 0) pack(br.line[idx], br.col[idx]) xor (pack(br.line[m], br.col[m]) * 31) else -1L
-            if (key == lastPair) return@execute
-            lastPair = key
-            val st = if (m >= 0) build(d, pack(br.line[idx], br.col[idx]), pack(br.line[m], br.col[m]))
-            else build(d, -1L, -1L)
-            if (ticket.get() == req) currentReceiver()?.setStyles(this, st)
-        }
-    }
-
-    /** Bracket matching that ignores brackets inside strings and comments (they are not PLAIN tokens). */
-    private fun findBrackets(text: CharSequence, d: SpanData): BracketData {
-        val ls = ArrayList<Int>()
-        val cs = ArrayList<Int>()
-        val chs = ArrayList<Char>()
-        var si = 0
-        var line = 0
-        var col = 0
-        var kind = Tok.PLAIN
-        for (i in 0 until text.length) {
-            while (si < d.n && (d.line[si] < line || (d.line[si] == line && d.col[si] <= col))) {
-                kind = d.kind[si].toInt(); si++
-            }
-            val ch = text[i]
-            if (ch == '\n') { line++; col = 0; continue }
-            if (kind == Tok.PLAIN && (ch == '(' || ch == ')' || ch == '[' || ch == ']' || ch == '{' || ch == '}')) {
-                ls.add(line); cs.add(col); chs.add(ch)
-            }
-            col++
-        }
-        val n = ls.size
-        val match = IntArray(n) { -1 }
-        val stacks = Array(3) { ArrayList<Int>() }
-        for (i in 0 until n) {
-            val ch = chs[i]
-            val t = when (ch) { '(', ')' -> 0; '[', ']' -> 1; else -> 2 }
-            if (ch == '(' || ch == '[' || ch == '{') stacks[t].add(i)
-            else if (stacks[t].isNotEmpty()) {
-                val o = stacks[t].removeAt(stacks[t].lastIndex)
-                match[o] = i; match[i] = o
-            }
-        }
-        return BracketData(ls.toIntArray(), cs.toIntArray(), match)
-    }
-
-    /** One block per indentation level; Sora draws these as the vertical guide lines. */
-    private fun computeBlocks(text: CharSequence): List<CodeBlock> {
-        val n = text.length
-        var iw = IntArray(1024)
-        var ic = IntArray(1024)
-        var lines = 0
-        var i = 0
-        while (i <= n) {
-            if (lines == iw.size) { iw = iw.copyOf(lines * 2); ic = ic.copyOf(lines * 2) }
-            var w = 0
-            var c = 0
-            var j = i
-            while (j < n && (text[j] == ' ' || text[j] == '\t')) {
-                w += if (text[j] == '\t') indentW else 1
-                c++; j++
-            }
-            val blank = j >= n || text[j] == '\n' || text[j] == '\r'
-            iw[lines] = if (blank) -1 else w
-            ic[lines] = c
-            lines++
-            while (j < n && text[j] != '\n') j++
-            i = j + 1
-        }
-        val out = ArrayList<CodeBlock>()
-        val stStart = ArrayList<Int>()
-        val stW = ArrayList<Int>()
-        var prev = -1
-        var prevW = 0
-        fun close(start: Int, end: Int) {
-            if (end > start && out.size < 50_000) {
-                val b = CodeBlock()
-                b.startLine = start; b.endLine = end
-                b.startColumn = ic[start]; b.endColumn = ic[start]
-                out.add(b)
-            }
-        }
-        for (ln in 0 until lines) {
-            val w = iw[ln]
-            if (w < 0) continue
-            while (stW.isNotEmpty() && w <= stW.last()) {
-                close(stStart.removeAt(stStart.lastIndex), prev); stW.removeAt(stW.lastIndex)
-            }
-            if (prev >= 0 && w > prevW) { stStart.add(prev); stW.add(prevW) }
-            prev = ln; prevW = w
-        }
-        while (stStart.isNotEmpty()) {
-            close(stStart.removeAt(stStart.lastIndex), prev); stW.removeAt(stW.lastIndex)
-        }
-        return out
-    }
-}
-
-class LexLanguage(val analyzer: LexAnalyzer) : EmptyLanguage() {
-    override fun getAnalyzeManager(): AnalyzeManager = analyzer
-}
-
-// ---------------------------------------------------------------------------
-// Handle used by the screens to drive the editor
-// ---------------------------------------------------------------------------
-
-class EditorHandle {
-    class Jump(val path: String, val line: Int, val col: Int, val len: Int)
-
-    internal var ed: CodeEditor? = null
-    var lang: LangDef? = null
-    var canUndo by mutableStateOf(false)
-    var canRedo by mutableStateOf(false)
-
-    /** Set by search screens; applied as soon as the editor shows that file. */
-    var pendingJump by mutableStateOf<Jump?>(null)
-
-    fun refreshUndo() {
-        val e = ed ?: return
-        canUndo = e.canUndo()
-        canRedo = e.canRedo()
-    }
-
-    fun undo() { ed?.undo(); refreshUndo() }
-    fun redo() { ed?.redo(); refreshUndo() }
-
-    private fun unit(): String = if (lang?.id == "makefile") "\t" else " ".repeat(Prefs.indentWidth)
-
-    fun tab() = typeText(unit())
-
-    fun typeText(s: String) {
-        ed?.commitText(s)
-        refreshUndo()
-    }
-
-    /** Inserts open+close with the caret between, or wraps the current selection. */
-    fun typePair(open: String, close: String) {
-        val e = ed ?: return
-        val c = e.cursor
-        if (c.isSelected) {
-            val sel = e.text.substring(c.left, c.right)
-            e.commitText(open + sel + close)
-        } else {
-            e.commitText(open + close)
-            val cc = e.cursor
-            e.setSelection(cc.leftLine, (cc.leftColumn - close.length).coerceAtLeast(0))
-        }
-        refreshUndo()
-    }
-
-    fun lineCount(): Int = ed?.text?.lineCount ?: 0
-
-    /** 1-based line number. Returns false when out of range. */
-    fun gotoLine(line1: Int): Boolean {
-        val e = ed ?: return false
-        if (line1 < 1 || line1 > e.text.lineCount) return false
-        e.setSelection(line1 - 1, 0)
-        callNoArg(e, "ensureSelectionVisible")
-        return true
-    }
-
-    fun select(line: Int, col: Int, len: Int) {
-        val e = ed ?: return
-        if (line < 0 || line >= e.text.lineCount) return
-        val max = e.text.getColumnCount(line)
-        val c = col.coerceIn(0, max)
-        e.setSelectionRegion(line, c, line, (c + len).coerceAtMost(max))
-        callNoArg(e, "ensureSelectionVisible")
-    }
-
-    /** Replaces every occurrence as ONE undoable edit. Returns the number replaced. */
-    fun replaceAll(find: String, with: String, matchCase: Boolean = true): Int {
-        val e = ed ?: return 0
-        if (find.isEmpty()) return 0
-        val t = e.text
-        val s = t.toString()
-        var count = 0
-        var from = 0
-        while (true) {
-            val i = s.indexOf(find, from, ignoreCase = !matchCase)
-            if (i < 0) break
-            count++; from = i + find.length
-        }
-        if (count == 0) return 0
-        val replaced = s.replace(find, with, ignoreCase = !matchCase)
-        val last = t.lineCount - 1
-        t.replace(0, 0, last, t.getColumnCount(last), replaced)
-        refreshUndo()
-        return count
-    }
-
-    private fun lineRange(e: CodeEditor): IntRange {
-        val c = e.cursor
-        val sl = c.leftLine
-        var el = c.rightLine
-        if (c.isSelected && c.rightColumn == 0 && el > sl) el--
-        return sl..el
-    }
-
-    fun indentLines() {
-        val e = ed ?: return
-        val t = e.text
-        val u = unit()
-        t.beginBatchEdit()
-        for (ln in lineRange(e)) if (t.getColumnCount(ln) > 0) t.insert(ln, 0, u)
-        t.endBatchEdit()
-        refreshUndo()
-    }
-
-    fun outdentLines() {
-        val e = ed ?: return
-        val t = e.text
-        val w = Prefs.indentWidth
-        t.beginBatchEdit()
-        for (ln in lineRange(e)) {
-            val s = t.getLineString(ln)
-            var k = 0
-            if (s.startsWith("\t")) k = 1
-            else while (k < w && k < s.length && s[k] == ' ') k++
-            if (k > 0) t.delete(ln, 0, ln, k)
-        }
-        t.endBatchEdit()
-        refreshUndo()
-    }
-
-    /** Returns an error message, or null on success. */
-    fun toggleComment(): String? {
-        val e = ed ?: return null
-        val p = lang?.commentPrefix ?: return "This file type has no line-comment syntax"
-        val t = e.text
-        val r = lineRange(e)
-        val body = r.filter { t.getLineString(it).isNotBlank() }
-        if (body.isEmpty()) return null
-        val allCommented = body.all { t.getLineString(it).trimStart().startsWith(p) }
-        t.beginBatchEdit()
-        if (allCommented) {
-            for (ln in body) {
-                val s = t.getLineString(ln)
-                val at = s.indexOf(p)
-                val extra = if (s.startsWith(" ", at + p.length)) 1 else 0
-                t.delete(ln, at, ln, at + p.length + extra)
-            }
-        } else {
-            val col = body.minOf { ln ->
-                val s = t.getLineString(ln); s.length - s.trimStart().length
-            }
-            for (ln in body) t.insert(ln, col, "$p ")
-        }
-        t.endBatchEdit()
-        refreshUndo()
-        return null
-    }
-
-    fun duplicateLine() {
-        val e = ed ?: return
-        val t = e.text
-        val r = lineRange(e)
-        val txt = r.joinToString("\n") { t.getLineString(it) }
-        t.insert(r.last, t.getColumnCount(r.last), "\n$txt")
-        refreshUndo()
-    }
-
-    fun deleteLine() {
-        val e = ed ?: return
-        val t = e.text
-        val r = lineRange(e)
-        t.beginBatchEdit()
-        if (r.last + 1 < t.lineCount) t.delete(r.first, 0, r.last + 1, 0)
-        else if (r.first > 0) t.delete(r.first - 1, t.getColumnCount(r.first - 1), r.last, t.getColumnCount(r.last))
-        else t.delete(0, 0, r.last, t.getColumnCount(r.last))
-        t.endBatchEdit()
-        refreshUndo()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The editor view
-// ---------------------------------------------------------------------------
-
-private class Applied(var buffer: BufferState) {
-    var content: Content? = null
-    var ver = -1
-    var sig = ""
-    var fontKey = ""
-    var settingText = false
-    var analyzer: LexAnalyzer? = null
+    // Glyphs used inside special folder icons
+    val Flask by lz("flask", "M19.8,18.4L14,10.67V6.5l1.35,-1.69C15.61,4.48 15.38,4 14.96,4H9.04C8.62,4 8.39,4.48 8.65,4.81L10,6.5v4.17L4.2,18.4C3.71,19.06 4.18,20 5,20h14C19.82,20 20.29,19.06 19.8,18.4z")
+    val Home by lz("home", "M10,20v-6h4v6h5v-8h3L12,3 2,12h3v8z")
+    val Code by lz("code", "M9.4,16.6L4.8,12l4.6,-4.6L8,6l-6,6 6,6 1.4,-1.4zM14.6,16.6l4.6,-4.6 -4.6,-4.6L16,6l6,6 -6,6 -1.4,-1.4z")
+    val Gamepad by lz("gamepad", "M21,6H3c-1.1,0 -2,0.9 -2,2v8c0,1.1 0.9,2 2,2h18c1.1,0 2,-0.9 2,-2V8c0,-1.1 -0.9,-2 -2,-2zM11,13H8v3H6v-3H3v-2h3V8h2v3h3v2zM15.5,15c-0.83,0 -1.5,-0.67 -1.5,-1.5s0.67,-1.5 1.5,-1.5 1.5,0.67 1.5,1.5 -0.67,1.5 -1.5,1.5zM19.5,12c-0.83,0 -1.5,-0.67 -1.5,-1.5S18.67,9 19.5,9s1.5,0.67 1.5,1.5 -0.67,1.5 -1.5,1.5z")
+    val Dashboard by lz("dashboard", "M3,13h8V3H3v10zM3,21h8v-6H3v6zM13,21h8V11h-8v10zM13,3v6h8V3h-8z")
+    val Archive by lz("archive", "M20.54,5.23l-1.39,-1.68C18.88,3.21 18.47,3 18,3H6c-0.47,0 -0.88,0.21 -1.16,0.55L3.46,5.23C3.17,5.57 3,6.02 3,6.5V19c0,1.1 0.9,2 2,2h14c1.1,0 2,-0.9 2,-2V6.5c0,-0.48 -0.17,-0.93 -0.46,-1.27zM12,17.5L6.5,12H10v-2h4v2h3.5L12,17.5zM5.12,5l0.81,-1h12l0.94,1H5.12z")
+    val Book by lz("book", "M18,2H6c-1.1,0 -2,0.9 -2,2v16c0,1.1 0.9,2 2,2h12c1.1,0 2,-0.9 2,-2V4c0,-1.1 -0.9,-2 -2,-2zM6,4h5v8l-2.5,-1.5L6,12V4z")
+    val Widgets by lz("widgets", "M13,13v8h8v-8h-8zM3,21h8v-8H3v8zM3,3v8h8V3H3zM16.66,1.69L11,7.34 16.66,13l5.66,-5.66 -5.66,-5.65z")
+    val Extension by lz("extension", "M20.5,11H19V7c0,-1.1 -0.9,-2 -2,-2h-4V3.5C13,2.12 11.88,1 10.5,1S8,2.12 8,3.5V5H4c-1.1,0 -1.99,0.9 -1.99,2v3.8H3.5c1.49,0 2.7,1.21 2.7,2.7s-1.21,2.7 -2.7,2.7H2V20c0,1.1 0.9,2 2,2h3.8v-1.5c0,-1.49 1.21,-2.7 2.7,-2.7 1.49,0 2.7,1.21 2.7,2.7V22H17c1.1,0 2,-0.9 2,-2v-4h1.5c1.38,0 2.5,-1.12 2.5,-2.5S21.88,11 20.5,11z")
+    val Terminal by lz("terminal", "M4,6l6,6 -6,6 -1.4,-1.4L7.2,12 2.6,7.4zM11,16h9v2h-9z")
+    val Database by lz("database", "M12,3C7.58,3 4,4.79 4,7v10c0,2.21 3.58,4 8,4s8,-1.79 8,-4V7c0,-2.21 -3.58,-4 -8,-4zM12,5c3.87,0 6,1.4 6,2s-2.13,2 -6,2 -6,-1.4 -6,-2 2.13,-2 6,-2zM18,17c0,0.6 -2.13,2 -6,2s-6,-1.4 -6,-2v-2.23C7.61,15.55 9.72,16 12,16s4.39,-0.45 6,-1.23V17zM18,12.5c0,0.6 -2.13,2 -6,2s-6,-1.4 -6,-2V10.27C7.61,11.05 9.72,11.5 12,11.5s4.39,-0.45 6,-1.23V12.5z")
+    val FontA by lz("font_a", "M9.93,13.5h4.14L12,7.98zM15.95,18.5l-1.14,-3L9.17,15.5l-1.12,3L5.96,18.5l5.11,-13h1.86l5.11,13h-2.09z")
+    val Music by lz("music", "M12,3v10.55c-0.59,-0.34 -1.27,-0.55 -2,-0.55 -2.21,0 -4,1.79 -4,4s1.79,4 4,4 4,-1.79 4,-4V7h4V3h-6z")
+    val Play by lz("play", "M8,5v14l11,-7z")
+    val Globe by lz("globe", "M11.99,2C6.47,2 2,6.48 2,12s4.47,10 9.99,10C17.52,22 22,17.52 22,12S17.52,2 11.99,2zM18.92,8h-2.95c-0.32,-1.25 -0.78,-2.45 -1.38,-3.56 1.84,0.63 3.37,1.91 4.33,3.56zM12,4.04c0.83,1.2 1.48,2.53 1.91,3.96h-3.82c0.43,-1.43 1.08,-2.76 1.91,-3.96zM4.26,14C4.1,13.36 4,12.69 4,12s0.1,-1.36 0.26,-2h3.38c-0.08,0.66 -0.14,1.32 -0.14,2 0,0.68 0.06,1.34 0.14,2L4.26,14zM5.08,16h2.95c0.32,1.25 0.78,2.45 1.38,3.56 -1.84,-0.63 -3.37,-1.9 -4.33,-3.56zM8.03,8L5.08,8c0.96,-1.66 2.49,-2.93 4.33,-3.56C8.81,5.55 8.35,6.75 8.03,8zM12,19.96c-0.83,-1.2 -1.48,-2.53 -1.91,-3.96h3.82c-0.43,1.43 -1.08,2.76 -1.91,3.96zM14.34,14L9.66,14c-0.09,-0.66 -0.16,-1.32 -0.16,-2 0,-0.68 0.07,-1.35 0.16,-2h4.68c0.09,0.65 0.16,1.32 0.16,2 0,0.68 -0.07,1.34 -0.16,2zM14.59,19.56c0.6,-1.11 1.06,-2.31 1.38,-3.56h2.95c-0.96,1.65 -2.49,2.93 -4.33,3.56zM16.36,14c0.08,-0.66 0.14,-1.32 0.14,-2 0,-0.68 -0.06,-1.34 -0.14,-2h3.38c0.16,0.64 0.26,1.31 0.26,2s-0.1,1.36 -0.26,2h-3.38z")
+    val Robot by lz("robot", "M6,7a6,6 0 0 1 12,0zM6,9h12v9a1,1 0 0 1 -1,1H7a1,1 0 0 1 -1,-1z")
+    val Phone by lz("phone", "M17,1.01L7,1c-1.1,0 -2,0.9 -2,2v18c0,1.1 0.9,2 2,2h10c1.1,0 2,-0.9 2,-2V3c0,-1.1 -0.9,-1.99 -2,-1.99zM17,19H7V5h10v14z")
 }
 
 @Composable
-fun CodeEditorView(
-    buffer: BufferState,
-    ws: Workspace,
-    handle: EditorHandle,
+fun GIcon(
+    v: ImageVector,
     modifier: Modifier = Modifier,
+    size: Dp = 22.dp,
+    tint: Color = Gx.text,
 ) {
-    val ctx = LocalContext.current
-    val bg = Gx.bg
-    val fg = Gx.text
-    val dim = Gx.textDim
-    val accent = Gx.accent
-    val scheme = Syntax.byId(Prefs.syntaxThemeId)
-    val tok = scheme.colors(bg, fg)
-    val fontKey = Prefs.fontKey
-    val fontSize = Prefs.fontSize
-    val smart = Prefs.smartActions
-    val guides = Prefs.indentGuides && !buffer.big
-    val brackets = Prefs.bracketHighlight && !buffer.big
-    val highlight = Prefs.syntaxHighlight && !buffer.big
-    val currentLine = Prefs.highlightCurrentLine
-    val indentW = Prefs.indentWidth
-    val content = buffer.content
-    val ver = ws.contentVersion
-    val lang = Languages.forName(java.io.File(buffer.path).name)
-
-    AndroidView(
-        modifier = modifier.interactive(),
-        factory = { c ->
-            val ed = CodeEditor(c)
-            val ap = Applied(buffer)
-            ed.tag = ap
-            ed.subscribeEvent(ContentChangeEvent::class.java) { _, _ ->
-                val a = ed.tag as? Applied
-                if (a != null && !a.settingText) {
-                    ws.onEdited(a.buffer.path)
-                    handle.refreshUndo()
-                }
-            }
-            ed.subscribeEvent(SelectionChangeEvent::class.java) { _, _ ->
-                val a = ed.tag as? Applied
-                if (a != null) {
-                    val cur = ed.cursor
-                    a.buffer.cursorLine = cur.leftLine
-                    a.buffer.cursorCol = cur.leftColumn
-                    if (cur.isSelected) a.analyzer?.update(-1, 0)
-                    else a.analyzer?.update(cur.leftLine, cur.leftColumn)
-                }
-            }
-            poke(ed, "wordwrap", false)
-            poke(ed, "lineNumberEnabled", true)
-            poke(ed, "scalable", false)
-            ed
-        },
-        update = { ed ->
-            val ap = ed.tag as Applied
-            ap.buffer = buffer
-
-            if (ap.fontKey != fontKey) {
-                val tf = Fonts.typeface(ctx, fontKey)
-                poke(ed, "typefaceText", tf)
-                poke(ed, "typefaceLineNumber", tf)
-                ap.fontKey = fontKey
-            }
-            poke(ed, "textSize", fontSize)
-            poke(ed, "tabWidth", indentW)
-            poke(ed, "blockLineEnabled", guides)
-            val props = ed.props
-            poke(props, "symbolPairAutoCompletion", smart)
-            poke(props, "autoIndent", smart)
-            poke(props, "deleteMultiSpaces", if (smart) -1 else 1)
-            poke(props, "deleteEmptyLineFast", smart)
-
-            if (content != null && (ap.content !== content || ap.ver != ver)) {
-                ap.settingText = true
-                try { ed.setText(content) } finally { ap.settingText = false }
-                ap.content = content
-                ap.ver = ver
-                ap.sig = ""
-                try {
-                    val ln = buffer.cursorLine.coerceIn(0, content.lineCount - 1)
-                    ed.setSelection(ln, buffer.cursorCol.coerceIn(0, content.getColumnCount(ln)))
-                } catch (_: Throwable) {
-                }
-            }
-
-            val sig = "${lang?.id}|$highlight|$guides|$brackets|$indentW|${scheme.id}|${bg.toArgb()}|${fg.toArgb()}|${accent.toArgb()}|$currentLine"
-            if (ap.sig != sig) {
-                ap.sig = sig
-                val cs = ed.colorScheme
-                val ids = intArrayOf(
-                    schemeId("TEXT_NORMAL"), schemeId("KEYWORD"), schemeId("ATTRIBUTE_NAME"),
-                    schemeId("LITERAL"), schemeId("ATTRIBUTE_VALUE"), schemeId("COMMENT"),
-                    schemeId("FUNCTION_NAME"),
-                )
-                for (i in ids.indices) if (ids[i] >= 0) try { cs.setColor(ids[i], tok[i]) } catch (_: Throwable) { }
-                setScheme(cs, "WHOLE_BACKGROUND", bg.toArgb())
-                setScheme(cs, "LINE_NUMBER_BACKGROUND", bg.toArgb())
-                setScheme(cs, "LINE_NUMBER", dim.toArgb())
-                setScheme(cs, "LINE_NUMBER_CURRENT", fg.toArgb())
-                setScheme(cs, "LINE_DIVIDER", 0)
-                setScheme(cs, "CURRENT_LINE", (if (currentLine) lerp(bg, fg, 0.07f) else bg).toArgb())
-                setScheme(cs, "SELECTION_INSERT", accent.toArgb())
-                setScheme(cs, "SELECTION_HANDLE", accent.toArgb())
-                setScheme(cs, "SELECTED_TEXT_BACKGROUND", accent.copy(alpha = 0.35f).toArgb())
-                setScheme(cs, "MATCHED_TEXT_BACKGROUND", accent.copy(alpha = 0.30f).toArgb())
-                setScheme(cs, "BLOCK_LINE", lerp(bg, fg, 0.17f).toArgb())
-                setScheme(cs, "BLOCK_LINE_CURRENT", lerp(bg, fg, 0.34f).toArgb())
-                setScheme(cs, "HIGHLIGHTED_DELIMITERS_FOREGROUND", fg.toArgb())
-                setScheme(cs, "HIGHLIGHTED_DELIMITERS_BACKGROUND", accent.copy(alpha = 0.40f).toArgb())
-                setScheme(cs, "HIGHLIGHTED_DELIMITERS_UNDERLINE", accent.toArgb())
-                setScheme(cs, "NON_PRINTABLE_CHAR", dim.toArgb())
-                setScheme(cs, "SCROLL_BAR_THUMB", lerp(bg, fg, 0.25f).toArgb())
-                setScheme(cs, "SCROLL_BAR_THUMB_PRESSED", dim.toArgb())
-                setScheme(cs, "SCROLL_BAR_TRACK", 0)
-
-                val analyzer = LexAnalyzer(
-                    lang, ids.map { if (it >= 0) it else 0 }.toIntArray(),
-                    schemeId("HIGHLIGHTED_DELIMITERS_FOREGROUND").coerceAtLeast(0),
-                    schemeId("HIGHLIGHTED_DELIMITERS_BACKGROUND").coerceAtLeast(0),
-                    highlight, guides, brackets, indentW
-                )
-                ap.analyzer = analyzer
-                ed.setEditorLanguage(LexLanguage(analyzer))
-            }
-
-            handle.ed = ed
-            handle.lang = lang
-            handle.refreshUndo()
-
-            val j = handle.pendingJump
-            if (j != null && j.path == buffer.path && content != null) {
-                handle.pendingJump = null
-                handle.select(j.line, j.col, j.len)
-            }
-        },
-        onRelease = { ed ->
-            if (handle.ed === ed) handle.ed = null
-            try { ed.release() } catch (_: Throwable) { }
-        }
-    )
-}
-
-// ---------------------------------------------------------------------------
-// Special-key toolbar (shown above the keyboard by EditorScreen)
-// ---------------------------------------------------------------------------
-
-@Composable
-private fun Key(
-    label: String? = null,
-    icon: ImageVector? = null,
-    enabled: Boolean = true,
-    onTap: () -> Unit,
-) {
-    Box(
-        Modifier
-            .defaultMinSize(minWidth = 44.dp, minHeight = 42.dp)
-            .pressable(enabled = enabled, scale = 0.88f, onTap = onTap)
-            .clip(Shapes.small)
-            .background(Gx.surfaceHigh)
-            .border(1.dp, Gx.border, Shapes.small)
-            .padding(horizontal = 10.dp),
-        contentAlignment = Alignment.Center
-    ) {
-        if (icon != null) GIcon(icon, size = 20.dp, tint = if (enabled) Gx.text else Gx.textDim.copy(alpha = 0.4f))
-        if (label != null) GText(label, style = Ty.label.copy(fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace), maxLines = 1)
-    }
-}
-
-@Composable
-fun SpecialKeysBar(handle: EditorHandle, modifier: Modifier = Modifier) {
-    Row(
-        modifier
-            .fillMaxWidth()
-            .background(Gx.surface)
-            .horizontalScroll(rememberScrollState())
-            .padding(horizontal = 6.dp, vertical = 6.dp),
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Key(icon = Ico.Undo, enabled = handle.canUndo) { handle.undo() }
-        Key(icon = Ico.Redo, enabled = handle.canRedo) { handle.redo() }
-        Key("Tab") { handle.tab() }
-        Key("{}") { handle.typePair("{", "}") }
-        Key("()") { handle.typePair("(", ")") }
-        Key("[]") { handle.typePair("[", "]") }
-        Key("<>") { handle.typePair("<", ">") }
-        for (ch in listOf("=", ";", ":", "'", "\"", "/", "\\", "|", "&", "!", "?", "+", "-", "*", "_", "$", "#", "@", "~")) {
-            Key(ch) { handle.typeText(ch) }
-        }
-    }
+    Icon(imageVector = v, contentDescription = null, modifier = modifier.size(size), tint = tint)
 }
