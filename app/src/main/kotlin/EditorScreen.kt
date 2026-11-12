@@ -63,8 +63,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
 import androidx.compose.ui.zIndex
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
+
+private const val COMMIT_MESSAGE = "Update from Gitex"
 
 /** Opens [path] in the editor. Returns true when it became the current file. */
 suspend fun openPath(ctx: Context, ws: Workspace, path: String): Boolean = when (val r = ws.open(path)) {
@@ -154,12 +157,20 @@ fun MainScreen(
     var dGit by remember { mutableStateOf<Boolean?>(null) }   // null none, false push, true commit
     var dConflict by remember { mutableStateOf<String?>(null) }
 
+    // Git state: 0 idle, 1 working, 2 "Pushed" (shown for about a second)
+    var pushState by remember { mutableIntStateOf(0) }
+    var committing by remember { mutableStateOf(false) }
+    var dRejected by remember { mutableStateOf(false) }
+    var dForce by remember { mutableStateOf(false) }
+    var dMergeConflicts by remember { mutableStateOf<List<String>?>(null) }
+
     val cur = ws.current
     val buf = ws.buffer(cur)
     val isMd = cur != null && (cur.endsWith(".md", true) || cur.endsWith(".markdown", true))
     val mdMode = isMd && mdOn[cur] == true
     val textFile = buf != null && buf.kind == FileKind.TEXT
     val imeVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
+    val gitBusy = pushState == 1 || committing
 
     fun closeDrawer() { st.cancel(); st.searching = false; drawerOpen = false }
 
@@ -196,9 +207,62 @@ fun MainScreen(
         if (ws.hasDirty()) dFolderGuard = true else onPickFolder()
     }
 
-    // ---- git entry points (Phase 2 performs the actual commit/push) ----
-    fun runGit(commit: Boolean) {
-        Banners.show(if (commit) "Commit arrives in the next build" else "Push arrives in the next build")
+    // ---- Git ----
+    fun runGit(commit: Boolean, force: Boolean = false) {
+        val root = ws.projectRoot ?: return
+        val link = Prefs.repoLink(root.absolutePath) ?: return
+        if (gitBusy) return
+        scope.launch {
+            // Unsaved editor text is committed as it is; the files on disk are not touched.
+            val buffers = ws.dirtyPaths().mapNotNull { p -> ws.buffer(p)?.content?.toString()?.let { p to it } }.toMap()
+            if (commit) committing = true else pushState = 1
+            val res = if (commit) GitOps.commit(root, link, COMMIT_MESSAGE, buffers)
+            else GitOps.push(root, link, COMMIT_MESSAGE, buffers, force)
+            committing = false
+            when (res) {
+                is GitResult.Committed -> Banners.show("Committed ${res.files} file${if (res.files == 1) "" else "s"} (not pushed yet)", BannerKind.Success)
+                GitResult.NothingToCommit -> Banners.show("Nothing to commit")
+                is GitResult.Pushed -> {
+                    pushState = 2
+                    Banners.show(if (res.upToDate) "Already up to date" else "Pushed", BannerKind.Success)
+                    if (!res.upToDate && GitOps.hasWorkflows(root)) BuildWatcher.start(ctx, link.owner, link.repo, res.sha, link.branch)
+                    delay(1000)
+                    pushState = 0
+                }
+                is GitResult.Rejected -> {
+                    pushState = 0
+                    Banners.show(if (res.remoteAhead) "Push rejected" else "Push rejected: ${res.detail}", BannerKind.Error)
+                    if (res.remoteAhead) dRejected = true
+                }
+                is GitResult.AuthFailed -> { pushState = 0; Banners.show(res.detail, BannerKind.Error) }
+                is GitResult.NotFound -> { pushState = 0; Banners.show(res.detail, BannerKind.Error) }
+                is GitResult.Offline -> { pushState = 0; Banners.show(res.detail, BannerKind.Error) }
+                is GitResult.Failed -> { pushState = 0; Banners.show(res.detail, BannerKind.Error) }
+            }
+        }
+    }
+
+    /** Brings GitHub's newer commits in, then pushes. Unsaved edits are saved first. */
+    fun mergeThenPush() {
+        val root = ws.projectRoot ?: return
+        val link = Prefs.repoLink(root.absolutePath) ?: return
+        scope.launch {
+            val r = ws.saveAll()
+            if (r.conflicts.isNotEmpty()) { dConflict = r.conflicts.first(); return@launch }
+            if (r.failed.isNotEmpty()) { Banners.show("Couldn't save ${r.failed.size} file(s)", BannerKind.Error); return@launch }
+            pushState = 1
+            when (val m = GitOps.fetchAndMerge(root, link)) {
+                MergeOutcome.Merged, MergeOutcome.UpToDate -> {
+                    ws.bump()
+                    ws.refreshFromDisk()
+                    pushState = 0
+                    runGit(false)
+                }
+                MergeOutcome.NoRemoteBranch -> { pushState = 0; Banners.show("The branch doesn't exist on GitHub yet", BannerKind.Error) }
+                is MergeOutcome.Conflicts -> { pushState = 0; dMergeConflicts = m.files }
+                is MergeOutcome.Failed -> { pushState = 0; Banners.show(m.detail, BannerKind.Error) }
+            }
+        }
     }
 
     fun startGit(commit: Boolean) {
@@ -334,8 +398,10 @@ fun MainScreen(
                 center = {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         GButton(
-                            if (Prefs.githubConnected) "Push" else "Connect to github",
+                            if (!Prefs.githubConnected) "Connect to github"
+                            else when (pushState) { 1 -> "Pushing..."; 2 -> "Pushed"; else -> "Push" },
                             onClick = { if (Prefs.githubConnected) startGit(false) else connecting = true },
+                            enabled = !Prefs.githubConnected || (pushState == 0 && !committing),
                             height = 40.dp, glow = false
                         )
                         Spacer(Modifier.width(8.dp))
@@ -362,7 +428,7 @@ fun MainScreen(
                                             saveAllThen { Banners.show("All files saved", BannerKind.Success) }
                                         },
                                         MItem("Autosave", toggle = Prefs.autosave, keepOpen = true) { Prefs.autosave = !Prefs.autosave },
-                                        MItem("Commit") { startGit(true) },
+                                        MItem("Commit", enabled = !gitBusy) { startGit(true) },
                                         MItem("Open File") { onPickFile() },
                                         MItem("Open Folder") { guardedOpenFolder() },
                                     ),
@@ -442,6 +508,48 @@ fun MainScreen(
             GText(
                 "Some files have changes that aren't saved to disk. Save all saves them first; " +
                     "${if (commit) "Commit" else "Push"} uses the content as it is in the editor.",
+                color = Gx.textDim
+            )
+        }
+    }
+    if (dRejected) {
+        GDialog(
+            onDismiss = { dRejected = false }, title = "GitHub has newer commits",
+            actions = listOf(
+                DialogBtn("Force push…", { dRejected = false; dForce = true }, danger = true),
+                DialogBtn("Merge and push", { dRejected = false; mergeThenPush() }, primary = true),
+            )
+        ) {
+            GText(
+                "The branch on GitHub contains commits this phone doesn't have, so the push was rejected and nothing on GitHub was changed. " +
+                    "Merge and push brings those commits in first (your unsaved edits are saved before that).",
+                color = Gx.textDim
+            )
+        }
+    }
+    if (dForce) {
+        val b = ws.projectRoot?.let { Prefs.repoLink(it.absolutePath)?.branch } ?: "the branch"
+        GDialog(
+            onDismiss = { dForce = false }, title = "Force push?",
+            actions = listOf(DialogBtn("Force push", { dForce = false; runGit(false, force = true) }, danger = true))
+        ) {
+            GText(
+                "This replaces \"$b\" on GitHub with what is on this phone. Any commits that exist only on GitHub will be lost. " +
+                    "Only continue if you are sure.",
+                color = Gx.danger
+            )
+        }
+    }
+    dMergeConflicts?.let { files ->
+        GDialog(
+            onDismiss = { dMergeConflicts = null }, title = "Can't merge automatically",
+            cancel = DialogBtn("Close", { dMergeConflicts = null }),
+            actions = listOf(DialogBtn("Force push…", { dMergeConflicts = null; dForce = true }, danger = true))
+        ) {
+            GText(
+                "GitHub and this phone both changed the same lines in:\n" + files.take(8).joinToString("\n") { "• $it" } +
+                    (if (files.size > 8) "\n…and ${files.size - 8} more" else "") +
+                    "\n\nNothing was changed. Resolve it on github.com, or force push to replace GitHub's version.",
                 color = Gx.textDim
             )
         }
