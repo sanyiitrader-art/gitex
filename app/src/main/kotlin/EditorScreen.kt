@@ -1,6 +1,7 @@
 package app.gitex
 
 import android.content.Context
+import android.os.SystemClock
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.tween
@@ -37,6 +38,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -137,6 +139,7 @@ fun MainScreen(
 
     var drawerOpen by remember { mutableStateOf(false) }
     var recentsOpen by remember { mutableStateOf(false) }
+    var recentsClosedAt by remember { mutableLongStateOf(0L) }
     var menuOpen by remember { mutableStateOf(false) }
     var connecting by remember { mutableStateOf(false) }
     var topH by remember { mutableIntStateOf(0) }
@@ -311,12 +314,23 @@ fun MainScreen(
                 }
             }
         }
-        OnDownOutside(recentsOpen, { panelRect }) { recentsOpen = false }
+        // Any touch outside the panel closes it. The time of that close is remembered so the
+        // arrow button's own tap (which arrives just after) does not immediately reopen it.
+        OnDownOutside(recentsOpen, { panelRect }) {
+            recentsOpen = false
+            recentsClosedAt = SystemClock.uptimeMillis()
+        }
 
         // top bar (the arrow button stays where it is; only its arrow flips)
         Box(Modifier.zIndex(2f).onSizeChanged { topH = it.height }) {
             GTopBar(
-                left = { IconBtn(Ico.Menu, { hide(); drawerOpen = true }) },
+                left = {
+                    IconBtn(Ico.Menu, {
+                        // Open first; hiding the keyboard must never be able to block this.
+                        drawerOpen = true
+                        try { hide() } catch (_: Throwable) { }
+                    })
+                },
                 center = {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         GButton(
@@ -327,7 +341,9 @@ fun MainScreen(
                         Spacer(Modifier.width(8.dp))
                         Box(
                             Modifier.size(40.dp)
-                                .pressable(scale = 0.9f, onTap = { recentsOpen = !recentsOpen })
+                                .pressable(scale = 0.9f, onTap = {
+                                    if (SystemClock.uptimeMillis() - recentsClosedAt > 600L) recentsOpen = !recentsOpen
+                                })
                                 .clip(Shapes.small).background(Gx.surfaceHigh).border(1.dp, Gx.border, Shapes.small),
                             contentAlignment = Alignment.Center
                         ) { GIcon(if (recentsOpen) Ico.ArrowUp else Ico.ArrowDown, size = 22.dp) }
@@ -373,18 +389,20 @@ fun MainScreen(
             )
         }
 
-        // drawer
-        GitexDrawer(open = drawerOpen, onClose = { closeDrawer() }) {
-            ExplorerDrawerContent(
-                ws, st,
-                onClose = { closeDrawer() },
-                onOpenFile = { path ->
-                    closeDrawer()
-                    scope.launch { openPath(ctx, ws, path) }
-                },
-                onNavigate = { r -> closeDrawer(); onNavigate(r) },
-                onPickFolder = { guardedOpenFolder() },
-            )
+        // drawer: drawn above everything, including the top bar and the recent files panel
+        Box(Modifier.fillMaxSize().zIndex(10f)) {
+            GitexDrawer(open = drawerOpen, onClose = { closeDrawer() }) {
+                ExplorerDrawerContent(
+                    ws, st,
+                    onClose = { closeDrawer() },
+                    onOpenFile = { path ->
+                        closeDrawer()
+                        scope.launch { openPath(ctx, ws, path) }
+                    },
+                    onNavigate = { r -> closeDrawer(); onNavigate(r) },
+                    onPickFolder = { guardedOpenFolder() },
+                )
+            }
         }
     }
 
