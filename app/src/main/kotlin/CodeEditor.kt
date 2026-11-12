@@ -75,6 +75,12 @@ private fun callNoArg(target: Any?, name: String) {
     }
 }
 
+private fun invokeGet(target: Any?, name: String): Any? = try {
+    target?.javaClass?.getMethod(name)?.invoke(target)
+} catch (_: Throwable) {
+    null
+}
+
 private fun schemeId(name: String): Int = try {
     EditorColorScheme::class.java.getField(name).getInt(null)
 } catch (_: Throwable) {
@@ -104,7 +110,6 @@ private class SpanData {
 }
 
 private class BracketData(val line: IntArray, val col: IntArray, val match: IntArray) {
-    /** Index of the bracket at exactly (l, c), or -1. Entries are sorted by position. */
     fun find(l: Int, c: Int): Int {
         if (c < 0) return -1
         var lo = 0
@@ -218,7 +223,6 @@ class LexAnalyzer(
         return styles
     }
 
-    /** Call when the caret moves. line < 0 clears the highlight. Cheap: runs on a background thread. */
     fun update(line: Int, col: Int) {
         val br = brackets ?: return
         val d = data ?: return
@@ -237,7 +241,6 @@ class LexAnalyzer(
         }
     }
 
-    /** Bracket matching that ignores brackets inside strings and comments (they are not PLAIN tokens). */
     private fun findBrackets(text: CharSequence, d: SpanData): BracketData {
         val ls = ArrayList<Int>()
         val cs = ArrayList<Int>()
@@ -274,9 +277,8 @@ class LexAnalyzer(
 
     /**
      * One block per indentation level; Sora draws these as the vertical guide lines.
-     * A line that contains only whitespace (for example the fresh indented line right after
-     * pressing Enter) may open a block, so its guide shows immediately, but it never closes one.
-     * Each block runs to the BOTTOM of its last line, so a single indented line already shows its guide.
+     * A whitespace-only line (the fresh indented line right after Enter) may open a block, so its guide
+     * shows at once, but it never closes one. Blocks run to the bottom of their last line.
      */
     private fun computeBlocks(text: CharSequence): List<CodeBlock> {
         val n = text.length
@@ -314,7 +316,6 @@ class LexAnalyzer(
                 val b = CodeBlock()
                 b.startLine = start; b.endLine = end
                 b.startColumn = ic[start]; b.endColumn = ic[start]
-                // Indentation blocks have no closing line, so draw down to the bottom of the last line.
                 poke(b, "toBottomOfEndLine", true)
                 out.add(b)
             }
@@ -357,8 +358,6 @@ class EditorHandle {
     var lang: LangDef? = null
     var canUndo by mutableStateOf(false)
     var canRedo by mutableStateOf(false)
-
-    /** Set by search screens; applied as soon as the editor shows that file. */
     var pendingJump by mutableStateOf<Jump?>(null)
 
     fun refreshUndo() {
@@ -379,7 +378,6 @@ class EditorHandle {
         refreshUndo()
     }
 
-    /** Inserts open+close with the caret between, or wraps the current selection. */
     fun typePair(open: String, close: String) {
         val e = ed ?: return
         val c = e.cursor
@@ -396,7 +394,6 @@ class EditorHandle {
 
     fun lineCount(): Int = ed?.text?.lineCount ?: 0
 
-    /** 1-based line number. Returns false when out of range. */
     fun gotoLine(line1: Int): Boolean {
         val e = ed ?: return false
         if (line1 < 1 || line1 > e.text.lineCount) return false
@@ -414,7 +411,6 @@ class EditorHandle {
         callNoArg(e, "ensureSelectionVisible")
     }
 
-    /** Replaces every occurrence as ONE undoable edit. Returns the number replaced. */
     fun replaceAll(find: String, with: String, matchCase: Boolean = true): Int {
         val e = ed ?: return 0
         if (find.isEmpty()) return 0
@@ -469,7 +465,6 @@ class EditorHandle {
         refreshUndo()
     }
 
-    /** Returns an error message, or null on success. */
     fun toggleComment(): String? {
         val e = ed ?: return null
         val p = lang?.commentPrefix ?: return "This file type has no line-comment syntax"
@@ -535,6 +530,17 @@ private class Applied(var buffer: BufferState) {
     var applying = false
 }
 
+private val ACTION_INSERT: Int = try {
+    ContentChangeEvent::class.java.getField("ACTION_INSERT").getInt(null)
+} catch (_: Throwable) {
+    1
+}
+
+private val angleLangs = setOf(
+    "html", "xml", "vue", "svelte", "cpp", "java", "kotlin", "typescript", "tsx",
+    "csharp", "swift", "rust", "dart", "scala"
+)
+
 /**
  * Smart Enter. Runs right after a new line was inserted: gives the new line the previous line's
  * indentation, plus one level after { ( [ (and after ":" in Python-like languages). Pressing Enter
@@ -574,6 +580,60 @@ private fun smartEnter(ed: CodeEditor, a: Applied) {
     }
 }
 
+/**
+ * Auto-closing brackets and quotes. [col] is the column just after the character that was typed.
+ * Typing a closer in front of the same closer steps over it instead of doubling it.
+ */
+private fun autoPair(ed: CodeEditor, a: Applied, c: Char, line: Int, col: Int) {
+    try {
+        val t = ed.text
+        if (line < 0 || line >= t.lineCount) return
+        val s = t.getLineString(line)
+        if (col < 1 || col > s.length || s[col - 1] != c) return
+        val cur = ed.cursor
+        if (cur.isSelected || cur.leftLine != line || cur.leftColumn != col) return
+        val next: Char? = if (col < s.length) s[col] else null
+        val prev: Char? = if (col >= 2) s[col - 2] else null
+
+        val isCloser = c == ')' || c == ']' || c == '}' || c == '"' || c == '\'' || c == '`' || c == '>'
+        if (isCloser && next == c) {
+            a.applying = true
+            try {
+                t.delete(line, col - 1, line, col)
+                ed.setSelection(line, col)
+            } finally {
+                a.applying = false
+            }
+            return
+        }
+
+        val closer = when (c) {
+            '(' -> ')'; '[' -> ']'; '{' -> '}'; '"' -> '"'; '\'' -> '\''; '`' -> '`'; '<' -> '>'
+            else -> return
+        }
+        val quote = c == '"' || c == '\'' || c == '`'
+        val wordPrev = prev != null && (prev.isLetterOrDigit() || prev == '_')
+        val lang = a.lang
+        if (quote && (lang == null || lang.id == "text" || lang.id == "markdown")) return
+        if (quote && wordPrev) return
+        if (c == '<') {
+            val l = lang ?: return
+            if (l.id !in angleLangs) return
+            if (!l.markup && !wordPrev) return
+        }
+        val nextOk = next == null || next.isWhitespace() || next in ")]}>,;:.\"'`"
+        if (!nextOk) return
+        a.applying = true
+        try {
+            t.insert(line, col, closer.toString())
+            ed.setSelection(line, col)
+        } finally {
+            a.applying = false
+        }
+    } catch (_: Throwable) {
+    }
+}
+
 @Composable
 fun CodeEditorView(
     buffer: BufferState,
@@ -601,13 +661,12 @@ fun CodeEditorView(
     val lang = Languages.forName(java.io.File(buffer.path).name)
 
     AndroidView(
-        // The left margin keeps wide line numbers away from the screen edge.
         modifier = modifier.padding(start = 10.dp).interactive(),
         factory = { c ->
             val ed = CodeEditor(c)
             val ap = Applied(buffer)
             ed.tag = ap
-            ed.subscribeEvent(ContentChangeEvent::class.java) { _, _ ->
+            ed.subscribeEvent(ContentChangeEvent::class.java) { ev, _ ->
                 val a = ed.tag as? Applied
                 if (a != null && !a.settingText) {
                     ws.onEdited(a.buffer.path)
@@ -615,8 +674,21 @@ fun CodeEditorView(
                     val count = ed.text.lineCount
                     val prevCount = a.lastCount
                     a.lastCount = count
-                    if (!a.applying && Prefs.smartActions && prevCount > 0 && count == prevCount + 1) {
-                        ed.post { smartEnter(ed, a) }
+                    if (!a.applying && Prefs.smartActions) {
+                        if (prevCount > 0 && count == prevCount + 1) {
+                            ed.post { smartEnter(ed, a) }
+                        } else {
+                            val act = invokeGet(ev, "getAction") as? Int
+                            val undo = invokeGet(ev, "isCausedByUndoManager") as? Boolean ?: false
+                            val txt = invokeGet(ev, "getChangedText")?.toString()
+                            val end = invokeGet(ev, "getChangeEnd")
+                            val eLine = invokeGet(end, "getLine") as? Int
+                            val eCol = invokeGet(end, "getColumn") as? Int
+                            if (act == ACTION_INSERT && !undo && txt != null && txt.length == 1 && eLine != null && eCol != null) {
+                                val ch = txt[0]
+                                ed.post { autoPair(ed, a, ch, eLine, eCol) }
+                            }
+                        }
                     }
                 }
             }
@@ -633,7 +705,6 @@ fun CodeEditorView(
             poke(ed, "wordwrap", false)
             poke(ed, "lineNumberEnabled", true)
             poke(ed, "scalable", false)
-            // Keep the line numbers fixed on the left while the code scrolls sideways.
             poke(ed, "pinLineNumber", true)
             poke(ed.props, "pinLineNumber", true)
             ed
@@ -653,7 +724,7 @@ fun CodeEditorView(
             poke(ed, "tabWidth", indentW)
             poke(ed, "blockLineEnabled", guides)
             val props = ed.props
-            poke(props, "symbolPairAutoCompletion", smart)
+            poke(props, "symbolPairAutoCompletion", false) // Gitex pairs brackets and quotes itself (autoPair)
             poke(props, "autoIndent", smart)
             poke(props, "deleteMultiSpaces", if (smart) -1 else 1)
             poke(props, "deleteEmptyLineFast", smart)
