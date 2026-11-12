@@ -3,7 +3,6 @@ package app.gitex
 import android.content.Context
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
@@ -24,7 +23,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.navigationBars
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.union
@@ -315,8 +313,7 @@ fun MainScreen(
         }
         OnDownOutside(recentsOpen, { panelRect }) { recentsOpen = false }
 
-        // top bar (drawn last so the arrow button stays above the panel it pushes down)
-        val arrowY by animateDpAsState(if (recentsOpen) 64.dp else 0.dp, tween(200), label = "arrowY")
+        // top bar (the arrow button stays where it is; only its arrow flips)
         Box(Modifier.zIndex(2f).onSizeChanged { topH = it.height }) {
             GTopBar(
                 left = { IconBtn(Ico.Menu, { hide(); drawerOpen = true }) },
@@ -329,7 +326,7 @@ fun MainScreen(
                         )
                         Spacer(Modifier.width(8.dp))
                         Box(
-                            Modifier.offset(y = arrowY).size(40.dp)
+                            Modifier.size(40.dp)
                                 .pressable(scale = 0.9f, onTap = { recentsOpen = !recentsOpen })
                                 .clip(Shapes.small).background(Gx.surfaceHigh).border(1.dp, Gx.border, Shapes.small),
                             contentAlignment = Alignment.Center
