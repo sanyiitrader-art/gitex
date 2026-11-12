@@ -1,5 +1,7 @@
 package app.gitex
 
+import android.content.Context
+import android.graphics.BitmapFactory
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
@@ -25,6 +27,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -33,6 +36,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.ImeAction
@@ -108,6 +112,8 @@ fun SettingsHomeScreen(onBack: () -> Unit, onNavigate: (Route) -> Unit) {
             glow = true, onClick = { onNavigate(Route.SetAppearance) })
         SettingCard(Ico.Github, "GitHub", "Account, Git identity and notifications",
             glow = true, onClick = { onNavigate(Route.SetGithub) })
+        SettingCard(Ico.Robot, "Gemini", "API key, model and tree creation behaviour",
+            glow = true, onClick = { onNavigate(Route.SetAi) })
         SettingCard(Ico.Delete, "Recycle Bin", "Restore or permanently delete removed items",
             glow = true, onClick = { onNavigate(Route.Recycle) })
     }
@@ -155,6 +161,38 @@ fun AppearanceSettingsScreen(onBack: () -> Unit, onNavigate: (Route) -> Unit) {
     }
 }
 
+// ---- theme previews: any of .jpg .jpeg .png .webp, matched by theme id or name ignoring case/spaces/punctuation ----
+
+private object PreviewFiles {
+    private var names: List<String>? = null
+
+    private fun norm(s: String) = s.lowercase().filter { it.isLetterOrDigit() }
+
+    fun find(ctx: Context, id: String, name: String): String? {
+        val list = names ?: (try { ctx.assets.list("theme-previews")?.toList() } catch (_: Exception) { null } ?: emptyList()).also { names = it }
+        val exts = setOf("jpg", "jpeg", "png", "webp")
+        val imgs = list.filter { it.substringAfterLast('.', "").lowercase() in exts }
+        val wanted = setOf(norm(id), norm(name))
+        imgs.firstOrNull { norm(it.substringBeforeLast('.')) in wanted }?.let { return it }
+        return imgs.firstOrNull { f -> val n = norm(f.substringBeforeLast('.')); wanted.any { it.isNotEmpty() && n.contains(it) } }
+    }
+}
+
+private fun loadThemePreview(ctx: Context, t: ThemeDef): ImageBitmap? {
+    val file = PreviewFiles.find(ctx, t.id, t.name) ?: return null
+    return try {
+        val path = "theme-previews/$file"
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        ctx.assets.open(path).use { BitmapFactory.decodeStream(it, null, bounds) }
+        var sample = 1
+        while (bounds.outWidth / sample > 1100 || bounds.outHeight / sample > 1100) sample *= 2
+        val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+        ctx.assets.open(path).use { BitmapFactory.decodeStream(it, null, opts) }?.asImageBitmap()
+    } catch (_: Exception) {
+        null
+    }
+}
+
 @Composable
 fun ThemePickerScreen(onClose: () -> Unit) {
     val ctx = LocalContext.current
@@ -170,7 +208,7 @@ fun ThemePickerScreen(onClose: () -> Unit) {
         ) {
             for (t in list) {
                 val img by produceState<ImageBitmap?>(null, t.id) {
-                    value = withContext(Dispatchers.IO) { Themes.loadPreview(ctx, t.id) }
+                    value = withContext(Dispatchers.IO) { loadThemePreview(ctx, t) }
                 }
                 GCard(
                     Modifier.fillMaxWidth(), selected = Prefs.themeId == t.id,
@@ -182,11 +220,11 @@ fun ThemePickerScreen(onClose: () -> Unit) {
                             if (Prefs.themeId == t.id) GIcon(Ico.Check, tint = Gx.accent)
                         }
                         Box(
-                            Modifier.fillMaxWidth().height(170.dp).background(Gx.bg.copy(alpha = 0.6f)),
+                            Modifier.fillMaxWidth().height(190.dp).background(Gx.bg.copy(alpha = 0.6f)),
                             contentAlignment = Alignment.Center
                         ) {
                             val b = img
-                            if (b != null) Image(b, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                            if (b != null) Image(b, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop, alignment = Alignment.TopCenter)
                             else GText("Later", color = Gx.textDim)
                         }
                     }
@@ -255,6 +293,60 @@ fun GitHubSettingsScreen(onBack: () -> Unit) {
             Spacer(Modifier.height(10.dp))
             GInput(email, { email = it; err = null }, Modifier.fillMaxWidth(), placeholder = "Email",
                 keyboardType = KeyboardType.Email, onDone = save)
+        }
+    }
+}
+
+@Composable
+fun AiSettingsScreen(onBack: () -> Unit) {
+    var tick by remember { mutableIntStateOf(0) }
+    val key = remember(tick) { Prefs.geminiKey() }
+    var keyDlg by remember { mutableStateOf(false) }
+    var removeDlg by remember { mutableStateOf(false) }
+
+    Page("Gemini", onBack) {
+        SettingCard(
+            Ico.Robot, "API key",
+            if (key == null) "Not set. Add your own key to use AI tree creation" else "Saved on this phone, ending …${key.takeLast(4)}",
+            glow = true, onClick = { keyDlg = true }
+        )
+        if (key != null) {
+            SettingCard(Ico.Delete, "Remove API key", "Delete it from this phone", onClick = { removeDlg = true })
+        }
+        Dropdown(Ico.Code, "Model", GeminiTree.MODELS, AiPrefs.model) { AiPrefs.model = it }
+        ToggleCard(
+            Ico.Wrench, "Use the built-in reader first",
+            "Normal trees are created instantly and offline, and nothing is sent to Google. Turn off to always ask Gemini.",
+            AiPrefs.localFirst
+        ) { AiPrefs.localFirst = it }
+        SettingCard(
+            Ico.Warning, "How it works",
+            "Automatic tries the newest model first and moves to the next one when Google reports it is busy. " +
+                "Only the text you paste is sent, using your own key, which is stored encrypted on this phone."
+        )
+    }
+
+    if (keyDlg) {
+        var v by remember { mutableStateOf(TextFieldValue("")) }
+        var err by remember { mutableStateOf<String?>(null) }
+        val save = {
+            if (v.text.trim().length < 20) err = "That doesn't look like an API key"
+            else { Prefs.saveGeminiKey(v.text); tick++; keyDlg = false; Banners.show("API key saved", BannerKind.Success) }
+        }
+        GDialog(onDismiss = { keyDlg = false }, title = if (key == null) "Add API key" else "Change API key",
+            actions = listOf(DialogBtn("Save", save, primary = true))) {
+            GText("Get a free key at aistudio.google.com/apikey and paste it here.", style = Ty.small, color = Gx.textDim)
+            Spacer(Modifier.height(10.dp))
+            err?.let { GText(it, style = Ty.small, color = Gx.danger, modifier = Modifier.padding(bottom = 6.dp)) }
+            GInput(v, { v = it; err = null }, Modifier.fillMaxWidth(), placeholder = "API key", error = err != null, mono = true, onDone = save)
+        }
+    }
+    if (removeDlg) {
+        GDialog(onDismiss = { removeDlg = false }, title = "Remove API key?",
+            actions = listOf(DialogBtn("Remove", {
+                Prefs.saveGeminiKey(null); tick++; removeDlg = false; Banners.show("API key removed")
+            }, danger = true))) {
+            GText("AI tree creation will ask for a key again the next time it needs one.", color = Gx.textDim)
         }
     }
 }
