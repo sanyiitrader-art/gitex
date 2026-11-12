@@ -2,6 +2,7 @@ package app.gitex
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -28,6 +29,12 @@ sealed class PlanResult {
 }
 
 class ExecResult(val created: Int, val error: String?)
+
+/** Settings of the AI tree creation (shown in Settings → Gemini). */
+object AiPrefs {
+    var model by PrefValue<String>("gemini_model", "auto", { s, k, d -> s.getString(k, d) ?: d }, { e, k, v -> e.putString(k, v) })
+    var localFirst by PrefValue<Boolean>("tree_local_first", true, { s, k, d -> s.getBoolean(k, d) }, { e, k, v -> e.putBoolean(k, v) })
+}
 
 /** Local, instant, offline reader for the usual ASCII-tree / indented / path-list formats. */
 object TreeParser {
@@ -78,7 +85,6 @@ object TreeParser {
         }
         if (out.isEmpty()) return null
 
-        // Anything that has something inside it is a folder.
         val parents = HashSet<String>()
         for (e in out) {
             var p = e.path
@@ -93,12 +99,30 @@ object TreeParser {
 /**
  * Optional AI reader for tree formats the local parser does not understand. The user's own API key is
  * used (stored encrypted on the phone, never in the APK) and only the pasted tree text is sent.
+ * Busy or unavailable models are retried and, in Automatic mode, replaced by the next model in the list.
  */
 object GeminiTree {
-    private const val MODEL = "gemini-3.5-flash-lite"
     private const val MAX_INPUT = 60_000
 
-    suspend fun interpret(key: String, text: String): Result<List<TreeEntry>> {
+    val AUTO = listOf("gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.5-flash-lite", "gemini-2.5-flash")
+
+    val MODELS = listOf(
+        "auto" to "Automatic (recommended)",
+        "gemini-3.5-flash-lite" to "Gemini 3.5 Flash-Lite",
+        "gemini-3.1-flash-lite" to "Gemini 3.1 Flash-Lite",
+        "gemini-2.5-flash-lite" to "Gemini 2.5 Flash-Lite",
+        "gemini-2.5-flash" to "Gemini 2.5 Flash",
+        "gemini-3.5-flash" to "Gemini 3.5 Flash",
+    )
+
+    private sealed class Call {
+        class Ok(val entries: List<TreeEntry>) : Call()
+        class Retry(val msg: String) : Call()   // busy / overloaded: wait and try again
+        class Skip(val msg: String) : Call()    // this model can't be used: try the next one
+        class Fatal(val msg: String) : Call()   // nothing will help (bad key ...)
+    }
+
+    private fun body(text: String): String {
         val prompt = "Convert the following project tree description into a flat list of files and folders.\n" +
             "Rules: use paths relative to the project root with '/' separators; give every folder type \"dir\" and every file type \"file\"; " +
             "include every file and folder that is mentioned; do not invent anything; ignore comments and descriptions; " +
@@ -114,38 +138,68 @@ object GeminiTree {
                         .put("type", JSONObject().put("type", "STRING").put("enum", JSONArray().put("file").put("dir"))))
                     .put("required", JSONArray().put("path").put("type")))))
             .put("required", JSONArray().put("entries"))
-        val body = JSONObject()
+        return JSONObject()
             .put("contents", JSONArray().put(JSONObject().put("parts", JSONArray().put(JSONObject().put("text", prompt)))))
             .put("generationConfig", JSONObject().put("responseMimeType", "application/json").put("responseSchema", schema))
             .toString()
-        return try {
-            val r = Http.request(
-                "POST", "https://generativelanguage.googleapis.com/v1beta/models/$MODEL:generateContent",
+    }
+
+    private suspend fun call(key: String, model: String, body: String): Call {
+        val r = try {
+            Http.request(
+                "POST", "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent",
                 mapOf("Content-Type" to "application/json", "x-goog-api-key" to key), body, timeoutMs = 60_000
             )
-            if (r.code !in 200..299) {
-                val msg = try { JSONObject(r.body).getJSONObject("error").optString("message") } catch (_: Exception) { "" }
-                return Result.failure(Exception(
-                    when (r.code) {
-                        400, 403 -> if (msg.contains("API key", true)) "Google doesn't accept this API key." else msg.ifBlank { "Google refused the request (HTTP ${r.code})." }
-                        429 -> "Google's free limit was reached. Try again in a minute."
-                        else -> msg.ifBlank { "Google returned an error (HTTP ${r.code})." }
-                    }
-                ))
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            return Call.Retry(if (e is IOException) Http.describe(e) else "Request failed")
+        }
+        if (r.code !in 200..299) {
+            val msg = try { JSONObject(r.body).getJSONObject("error").optString("message") } catch (_: Exception) { "" }
+            return when {
+                msg.contains("API key", true) && (r.code == 400 || r.code == 401 || r.code == 403) ->
+                    Call.Fatal("Google doesn't accept this API key. Check it in Settings → Gemini.")
+                r.code == 429 || r.code == 500 || r.code == 502 || r.code == 503 || r.code == 504 ->
+                    Call.Retry(msg.ifBlank { "The model is busy right now." })
+                else -> Call.Skip(msg.ifBlank { "HTTP ${r.code}" })
             }
+        }
+        return try {
             val j = JSONObject(r.body)
             val txt = j.getJSONArray("candidates").getJSONObject(0).getJSONObject("content")
                 .getJSONArray("parts").getJSONObject(0).getString("text")
             val arr = JSONObject(txt).getJSONArray("entries")
-            Result.success((0 until arr.length()).map {
+            Call.Ok((0 until arr.length()).map {
                 val o = arr.getJSONObject(it)
                 TreeEntry(o.getString("path"), o.optString("type") == "dir")
             })
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            Result.failure(Exception(if (e is IOException) Http.describe(e) else "The AI's answer couldn't be understood. Try again."))
+        } catch (_: Exception) {
+            Call.Retry("The answer couldn't be understood.")
         }
+    }
+
+    suspend fun interpret(key: String, text: String): Result<List<TreeEntry>> {
+        val chosen = AiPrefs.model
+        val auto = chosen == "auto" || chosen !in MODELS.map { it.first }
+        val order = if (auto) AUTO else listOf(chosen)
+        val attempts = if (auto) 2 else 3
+        val b = body(text)
+        var last = ""
+        for (m in order) {
+            for (a in 0 until attempts) {
+                when (val c = call(key, m, b)) {
+                    is Call.Ok -> return Result.success(c.entries)
+                    is Call.Fatal -> return Result.failure(Exception(c.msg))
+                    is Call.Skip -> { last = c.msg; break }
+                    is Call.Retry -> { last = c.msg; if (a < attempts - 1) delay(1500L * (a + 1)) }
+                }
+            }
+        }
+        return Result.failure(Exception(
+            (if (auto) "Google's models are all busy right now" else "That model is busy right now") +
+                " ($last). Try again in a minute, or pick another model in Settings → Gemini."
+        ))
     }
 }
 
@@ -164,7 +218,6 @@ object TreePlanner {
         else -> null
     }
 
-    /** The single top-level folder the whole tree sits in (for example the project name), or null. */
     fun commonRoot(entries: List<TreeEntry>): String? {
         if (entries.isEmpty()) return null
         val first = entries.map { it.path.trimStart('.', '/').substringBefore('/') }.distinct()
@@ -185,7 +238,7 @@ object TreePlanner {
         if (entries.isEmpty()) return PlanResult.Problems(listOf("No files or folders were found in the text."))
         if (entries.size > MAX_ENTRIES) return PlanResult.Problems(listOf("That's more than $MAX_ENTRIES items; please split it up."))
 
-        val planned = LinkedHashMap<String, Pair<String, Boolean>>() // lowercase path -> (path, isDir)
+        val planned = LinkedHashMap<String, Pair<String, Boolean>>()
         fun add(path: String, isDir: Boolean) {
             val key = path.lowercase()
             val ex = planned[key]
@@ -232,13 +285,20 @@ object TreePlanner {
 }
 
 object TreeCreator {
-    /** Local parser first (instant, offline); the AI is only asked when the text isn't a recognisable tree. */
+    /**
+     * By default the local parser goes first (instant, offline, nothing leaves the phone); the AI is only asked
+     * when the text isn't a recognisable tree. With "built-in reader first" off, the AI is asked first and the
+     * local parser is the fallback if the AI fails.
+     */
     suspend fun interpret(text: String): Interpret {
         if (text.isBlank()) return Interpret.Failed("Paste a repository tree first.")
         val local = TreeParser.parse(text)
-        if (local != null) return Interpret.Entries(local, viaAi = false)
-        val key = Prefs.geminiKey() ?: return Interpret.NeedsKey
-        return aiInterpret(key, text)
+        if (AiPrefs.localFirst && local != null) return Interpret.Entries(local, viaAi = false)
+        val key = Prefs.geminiKey()
+        if (key == null) return if (local != null) Interpret.Entries(local, viaAi = false) else Interpret.NeedsKey
+        val r = aiInterpret(key, text)
+        if (r is Interpret.Failed && local != null) return Interpret.Entries(local, viaAi = false)
+        return r
     }
 
     suspend fun aiInterpret(key: String, text: String): Interpret {
