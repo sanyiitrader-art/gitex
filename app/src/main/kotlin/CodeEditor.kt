@@ -276,6 +276,7 @@ class LexAnalyzer(
      * One block per indentation level; Sora draws these as the vertical guide lines.
      * A line that contains only whitespace (for example the fresh indented line right after
      * pressing Enter) may open a block, so its guide shows immediately, but it never closes one.
+     * Each block runs to the BOTTOM of its last line, so a single indented line already shows its guide.
      */
     private fun computeBlocks(text: CharSequence): List<CodeBlock> {
         val n = text.length
@@ -313,6 +314,8 @@ class LexAnalyzer(
                 val b = CodeBlock()
                 b.startLine = start; b.endLine = end
                 b.startColumn = ic[start]; b.endColumn = ic[start]
+                // Indentation blocks have no closing line, so draw down to the bottom of the last line.
+                poke(b, "toBottomOfEndLine", true)
                 out.add(b)
             }
         }
@@ -598,7 +601,8 @@ fun CodeEditorView(
     val lang = Languages.forName(java.io.File(buffer.path).name)
 
     AndroidView(
-        modifier = modifier.interactive(),
+        // The left margin keeps wide line numbers away from the screen edge.
+        modifier = modifier.padding(start = 10.dp).interactive(),
         factory = { c ->
             val ed = CodeEditor(c)
             val ap = Applied(buffer)
