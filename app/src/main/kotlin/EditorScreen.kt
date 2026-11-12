@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.SystemClock
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
@@ -11,6 +12,8 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -24,30 +27,39 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
@@ -60,12 +72,16 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
 import androidx.compose.ui.zIndex
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
+import kotlin.math.roundToInt
 
 private const val COMMIT_MESSAGE = "Update from Gitex"
 
@@ -84,46 +100,117 @@ private class MItem(
     val onClick: () -> Unit,
 )
 
+/** Menu with a bare scroll thumb in its left gutter, so it is obvious that it scrolls. */
 @Composable
 private fun MainMenu(sections: List<Pair<String, List<MItem>>>, onDismiss: () -> Unit) {
     val maxH = (LocalConfiguration.current.screenHeightDp * 0.78f).dp
+    val dens = LocalDensity.current
+    val sc = rememberScrollState()
+    var viewH by remember { mutableIntStateOf(0) }
     Popup(
         alignment = Alignment.TopEnd,
-        offset = IntOffset(0, with(LocalDensity.current) { 46.dp.roundToPx() }),
+        offset = IntOffset(0, with(dens) { 46.dp.roundToPx() }),
         onDismissRequest = onDismiss,
         properties = PopupProperties(focusable = true)
     ) {
         CompositionLocalProvider(LocalInteractive provides null) {
-            Column(
-                Modifier.width(250.dp).heightIn(max = maxH)
-                    .glow(Shapes.card, androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.6f), 14.dp)
+            Box(
+                Modifier.width(262.dp).heightIn(max = maxH)
+                    .glow(Shapes.card, Color.Black.copy(alpha = 0.6f), 14.dp)
                     .clip(Shapes.card).background(Gx.surfaceHigh, Shapes.card).border(1.dp, Gx.border, Shapes.card)
-                    .verticalScroll(rememberScrollState()).padding(vertical = 6.dp)
             ) {
-                for ((title, items) in sections) {
-                    GText(
-                        title.uppercase(), style = Ty.tiny.copy(fontWeight = FontWeight.SemiBold), color = Gx.accent,
-                        modifier = Modifier.padding(horizontal = 18.dp, vertical = 8.dp)
-                    )
-                    for (it in items) {
-                        Row(
-                            Modifier.fillMaxWidth()
-                                .pressable(enabled = it.enabled, scale = 0.97f, onTap = { if (!it.keepOpen) onDismiss(); it.onClick() })
-                                .padding(horizontal = 18.dp, vertical = 12.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            GText(
-                                it.label, modifier = Modifier.weight(1f), maxLines = 1,
-                                color = if (it.enabled) Gx.text else Gx.textDim.copy(alpha = 0.5f)
-                            )
-                            if (it.toggle != null) {
-                                GIcon(if (it.toggle) Ico.CheckOn else Ico.CheckOff, size = 22.dp, tint = if (it.toggle) Gx.accent else Gx.textDim)
+                Column(
+                    Modifier.fillMaxWidth().onSizeChanged { viewH = it.height }
+                        .verticalScroll(sc).padding(start = 14.dp, top = 6.dp, bottom = 6.dp)
+                ) {
+                    for ((title, items) in sections) {
+                        GText(
+                            title.uppercase(), style = Ty.tiny.copy(fontWeight = FontWeight.SemiBold), color = Gx.accent,
+                            modifier = Modifier.padding(horizontal = 18.dp, vertical = 8.dp)
+                        )
+                        for (it in items) {
+                            Row(
+                                Modifier.fillMaxWidth()
+                                    .pressable(enabled = it.enabled, scale = 0.97f, onTap = { if (!it.keepOpen) onDismiss(); it.onClick() })
+                                    .padding(horizontal = 18.dp, vertical = 12.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                GText(
+                                    it.label, modifier = Modifier.weight(1f), maxLines = 1,
+                                    color = if (it.enabled) Gx.text else Gx.textDim.copy(alpha = 0.5f)
+                                )
+                                if (it.toggle != null) {
+                                    GIcon(if (it.toggle) Ico.CheckOn else Ico.CheckOff, size = 22.dp, tint = if (it.toggle) Gx.accent else Gx.textDim)
+                                }
                             }
                         }
                     }
                 }
+                if (sc.maxValue > 0 && viewH > 0) {
+                    val total = viewH + sc.maxValue
+                    val thumbH = (viewH.toFloat() * viewH / total).coerceAtLeast(28f * dens.density)
+                    val y = (viewH - thumbH) * sc.value / sc.maxValue
+                    Box(
+                        Modifier.padding(start = 5.dp)
+                            .offset { IntOffset(0, y.roundToInt()) }
+                            .width(4.dp).height(with(dens) { thumbH.toDp() })
+                            .clip(RoundedCornerShape(50)).background(Gx.accent.copy(alpha = 0.9f))
+                    )
+                }
             }
         }
+    }
+}
+
+/**
+ * Opens on touch-down instead of on tap-release, and listens on the Initial pass without consuming,
+ * so a cancelled or stolen tap can never leave this button dead.
+ */
+@Composable
+private fun MenuButton(onOpen: () -> Unit) {
+    var pressed by remember { mutableStateOf(false) }
+    val s by animateFloatAsState(if (pressed) 0.88f else 1f, tween(100), label = "menuBtn")
+    val open by rememberUpdatedState(onOpen)
+    Box(
+        Modifier.size(44.dp).interactive()
+            .graphicsLayer { scaleX = s; scaleY = s }
+            .pointerInput(Unit) {
+                awaitEachGesture {
+                    awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                    pressed = true
+                    open()
+                    do {
+                        val e = awaitPointerEvent(PointerEventPass.Initial)
+                    } while (e.changes.any { it.pressed })
+                    pressed = false
+                }
+            },
+        contentAlignment = Alignment.Center
+    ) { GIcon(Ico.Menu) }
+}
+
+@Composable
+private fun TopActionButton(
+    connected: Boolean, pushState: Int, busy: Boolean, verb: String, status: String,
+    onPush: () -> Unit, onCancel: () -> Unit, onConnect: () -> Unit,
+) {
+    when {
+        !connected -> GButton("Connect to github", onConnect, height = 40.dp, glow = false)
+        busy -> Column(
+            Modifier.heightIn(min = 44.dp).widthIn(min = 120.dp, max = 200.dp)
+                .pressable(scale = 0.95f, onTap = onCancel)
+                .clip(Shapes.card).background(Gx.accent, Shapes.card)
+                .padding(horizontal = 16.dp, vertical = 4.dp),
+            horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center
+        ) {
+            GText("Cancel", style = Ty.label, color = Gx.onAccent, maxLines = 1)
+            GText(
+                if (status.isBlank()) "$verb…" else "$verb · $status",
+                style = Ty.tiny.copy(fontSize = 10.sp), color = Gx.onAccent.copy(alpha = 0.85f), maxLines = 1
+            )
+        }
+        pushState == 2 -> GButton("Pushed", {}, enabled = false, height = 40.dp, glow = false)
+        else -> GButton("Push", onPush, height = 40.dp, glow = false)
     }
 }
 
@@ -141,6 +228,7 @@ fun MainScreen(
     val hide = rememberHideKeyboard()
 
     var drawerOpen by remember { mutableStateOf(false) }
+    var drawerEpoch by remember { mutableIntStateOf(0) }
     var recentsOpen by remember { mutableStateOf(false) }
     var recentsClosedAt by remember { mutableLongStateOf(0L) }
     var menuOpen by remember { mutableStateOf(false) }
@@ -160,9 +248,13 @@ fun MainScreen(
     // Git state: 0 idle, 1 working, 2 "Pushed" (shown for about a second)
     var pushState by remember { mutableIntStateOf(0) }
     var committing by remember { mutableStateOf(false) }
+    var gitStatus by remember { mutableStateOf("") }
+    var gitJob by remember { mutableStateOf<Job?>(null) }
     var dRejected by remember { mutableStateOf(false) }
     var dForce by remember { mutableStateOf(false) }
     var dMergeConflicts by remember { mutableStateOf<List<String>?>(null) }
+    var dLarge by remember { mutableStateOf<Triple<Boolean, Int, Long>?>(null) }
+    val largeOk = remember { mutableSetOf<String>() }
 
     val cur = ws.current
     val buf = ws.buffer(cur)
@@ -187,7 +279,6 @@ fun MainScreen(
         }
     }
 
-    /** Saves everything; calls [then] only if all saves went through. */
     fun saveAllThen(then: () -> Unit) {
         scope.launch {
             val r = ws.saveAll()
@@ -208,50 +299,105 @@ fun MainScreen(
     }
 
     // ---- Git ----
+    fun cancelGit() {
+        gitJob?.cancel()
+        gitJob = null
+        pushState = 0
+        committing = false
+        Banners.show("Cancelled")
+    }
+
     fun runGit(commit: Boolean, force: Boolean = false) {
         val root = ws.projectRoot ?: return
         val link = Prefs.repoLink(root.absolutePath) ?: return
         if (gitBusy) return
-        scope.launch {
-            // Unsaved editor text is committed as it is; the files on disk are not touched.
+        if (commit) committing = true else pushState = 1
+        gitStatus = "Starting…"
+        gitJob = scope.launch {
             val buffers = ws.dirtyPaths().mapNotNull { p -> ws.buffer(p)?.content?.toString()?.let { p to it } }.toMap()
-            if (commit) committing = true else pushState = 1
-            val res = if (commit) GitOps.commit(root, link, COMMIT_MESSAGE, buffers)
-            else GitOps.push(root, link, COMMIT_MESSAGE, buffers, force)
+            var offlineShown = false
+            var tries = 0
+            var res: GitResult = GitResult.NothingToCommit
+            while (true) {
+                if (!Net.online(ctx)) {
+                    gitStatus = "Waiting for network…"
+                    if (!offlineShown) {
+                        offlineShown = true
+                        Banners.show("No network. Gitex will keep waiting and continue by itself when it is back.")
+                    }
+                    Net.await(ctx)
+                    delay(1200)
+                }
+                gitStatus = "Starting…"
+                res = if (commit) GitOps.commit(root, link, COMMIT_MESSAGE, buffers) { gitStatus = it }
+                else GitOps.push(root, link, COMMIT_MESSAGE, buffers, force) { gitStatus = it }
+                if (res is GitResult.Offline && ++tries < 40) {
+                    gitStatus = "Waiting for network…"
+                    if (!offlineShown) {
+                        offlineShown = true
+                        Banners.show("No network. Gitex will keep waiting and continue by itself when it is back.")
+                    }
+                    if (Net.online(ctx)) delay(4000) else Net.await(ctx)
+                    continue
+                }
+                break
+            }
+            val result = res
             committing = false
-            when (res) {
-                is GitResult.Committed -> Banners.show("Committed ${res.files} file${if (res.files == 1) "" else "s"} (not pushed yet)", BannerKind.Success)
+            when (result) {
+                is GitResult.Committed -> Banners.show(
+                    "Committed ${result.files} file${if (result.files == 1) "" else "s"} (not pushed yet)" +
+                        if (result.skipped.isEmpty()) "" else ", skipped ${result.skipped.size} over 100 MB",
+                    BannerKind.Success
+                )
                 GitResult.NothingToCommit -> Banners.show("Nothing to commit")
                 is GitResult.Pushed -> {
                     pushState = 2
-                    Banners.show(if (res.upToDate) "Already up to date" else "Pushed", BannerKind.Success)
-                    if (!res.upToDate && GitOps.hasWorkflows(root)) BuildWatcher.start(ctx, link.owner, link.repo, res.sha, link.branch)
+                    Banners.show(
+                        (if (result.upToDate) "Already up to date" else "Pushed") +
+                            if (result.skipped.isEmpty()) "" else " (skipped ${result.skipped.size} file(s) over 100 MB)",
+                        BannerKind.Success
+                    )
+                    if (!result.upToDate && GitOps.hasWorkflows(root)) BuildWatcher.start(ctx, link.owner, link.repo, result.sha, link.branch)
                     delay(1000)
                     pushState = 0
                 }
                 is GitResult.Rejected -> {
                     pushState = 0
-                    Banners.show(if (res.remoteAhead) "Push rejected" else "Push rejected: ${res.detail}", BannerKind.Error)
-                    if (res.remoteAhead) dRejected = true
+                    Banners.show(if (result.remoteAhead) "Push rejected" else "Push rejected: ${result.detail}", BannerKind.Error)
+                    if (result.remoteAhead) dRejected = true
                 }
-                is GitResult.AuthFailed -> { pushState = 0; Banners.show(res.detail, BannerKind.Error) }
-                is GitResult.NotFound -> { pushState = 0; Banners.show(res.detail, BannerKind.Error) }
-                is GitResult.Offline -> { pushState = 0; Banners.show(res.detail, BannerKind.Error) }
-                is GitResult.Failed -> { pushState = 0; Banners.show(res.detail, BannerKind.Error) }
+                is GitResult.AuthFailed -> { pushState = 0; Banners.show(result.detail, BannerKind.Error) }
+                is GitResult.NotFound -> { pushState = 0; Banners.show(result.detail, BannerKind.Error) }
+                is GitResult.Offline -> { pushState = 0; Banners.show(result.detail, BannerKind.Error) }
+                is GitResult.Failed -> { pushState = 0; Banners.show(result.detail, BannerKind.Error) }
             }
         }
     }
 
-    /** Brings GitHub's newer commits in, then pushes. Unsaved edits are saved first. */
+    /** Warns before the first push of a very large folder, then runs. */
+    fun launchGit(commit: Boolean) {
+        val root = ws.projectRoot ?: return
+        if (gitBusy) return
+        if (GitOps.hasCommits(root) || root.absolutePath in largeOk) { runGit(commit); return }
+        scope.launch {
+            val m = GitOps.measure(root)
+            if (m.files > 8000 || m.bytes > 250L * 1024 * 1024) dLarge = Triple(commit, m.files, m.bytes)
+            else runGit(commit)
+        }
+    }
+
     fun mergeThenPush() {
         val root = ws.projectRoot ?: return
         val link = Prefs.repoLink(root.absolutePath) ?: return
-        scope.launch {
+        if (gitBusy) return
+        pushState = 1
+        gitStatus = "Saving files…"
+        gitJob = scope.launch {
             val r = ws.saveAll()
-            if (r.conflicts.isNotEmpty()) { dConflict = r.conflicts.first(); return@launch }
-            if (r.failed.isNotEmpty()) { Banners.show("Couldn't save ${r.failed.size} file(s)", BannerKind.Error); return@launch }
-            pushState = 1
-            when (val m = GitOps.fetchAndMerge(root, link)) {
+            if (r.conflicts.isNotEmpty()) { pushState = 0; dConflict = r.conflicts.first(); return@launch }
+            if (r.failed.isNotEmpty()) { pushState = 0; Banners.show("Couldn't save ${r.failed.size} file(s)", BannerKind.Error); return@launch }
+            when (val m = GitOps.fetchAndMerge(root, link, COMMIT_MESSAGE, emptyMap()) { gitStatus = it }) {
                 MergeOutcome.Merged, MergeOutcome.UpToDate -> {
                     ws.bump()
                     ws.refreshFromDisk()
@@ -270,12 +416,11 @@ fun MainScreen(
         val root = ws.projectRoot ?: run { Banners.show("Open a project folder first", BannerKind.Error); return }
         if (Prefs.repoLink(root.absolutePath) == null) { dRepo = if (commit) 3 else 2; return }
         if (ws.hasDirty()) { dGit = commit; return }
-        runGit(commit)
+        launchGit(commit)
     }
 
     // ---- layout ----
     Box(Modifier.fillMaxSize().background(Gx.bg)) {
-        // main column (editor area), below the top bar
         Column(
             Modifier.fillMaxSize().padding(top = with(LocalDensity.current) { topH.toDp() })
                 .windowInsetsPadding(WindowInsets.navigationBars.union(WindowInsets.ime))
@@ -335,7 +480,7 @@ fun MainScreen(
             if (imeVisible && textFile && !mdMode) SpecialKeysBar(handle)
         }
 
-        // recent files panel (under the top bar, above the editor)
+        // recent files panel
         Box(Modifier.padding(top = with(LocalDensity.current) { topH.toDp() }).zIndex(1f)) {
             AnimatedVisibility(
                 visible = recentsOpen,
@@ -378,31 +523,31 @@ fun MainScreen(
                 }
             }
         }
-        // Any touch outside the panel closes it. The time of that close is remembered so the
-        // arrow button's own tap (which arrives just after) does not immediately reopen it.
         OnDownOutside(recentsOpen, { panelRect }) {
             recentsOpen = false
             recentsClosedAt = SystemClock.uptimeMillis()
         }
 
-        // top bar (the arrow button stays where it is; only its arrow flips)
+        // top bar
         Box(Modifier.zIndex(2f).onSizeChanged { topH = it.height }) {
             GTopBar(
                 left = {
-                    IconBtn(Ico.Menu, {
-                        // Open first; hiding the keyboard must never be able to block this.
+                    MenuButton {
+                        // A fresh drawer every time: no stale drag/animation state can survive.
+                        drawerEpoch++
                         drawerOpen = true
-                        try { hide() } catch (_: Throwable) { }
-                    })
+                        scope.launch {
+                            delay(120)
+                            try { hide() } catch (_: Throwable) { }
+                        }
+                    }
                 },
                 center = {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        GButton(
-                            if (!Prefs.githubConnected) "Connect to github"
-                            else when (pushState) { 1 -> "Pushing..."; 2 -> "Pushed"; else -> "Push" },
-                            onClick = { if (Prefs.githubConnected) startGit(false) else connecting = true },
-                            enabled = !Prefs.githubConnected || (pushState == 0 && !committing),
-                            height = 40.dp, glow = false
+                        TopActionButton(
+                            connected = Prefs.githubConnected, pushState = pushState, busy = gitBusy,
+                            verb = if (committing) "Committing" else "Pushing", status = gitStatus,
+                            onPush = { startGit(false) }, onCancel = { cancelGit() }, onConnect = { connecting = true }
                         )
                         Spacer(Modifier.width(8.dp))
                         Box(
@@ -455,24 +600,25 @@ fun MainScreen(
             )
         }
 
-        // drawer: drawn above everything, including the top bar and the recent files panel
+        // drawer: above everything, rebuilt fresh on every open
         Box(Modifier.fillMaxSize().zIndex(10f)) {
-            GitexDrawer(open = drawerOpen, onClose = { closeDrawer() }) {
-                ExplorerDrawerContent(
-                    ws, st,
-                    onClose = { closeDrawer() },
-                    onOpenFile = { path ->
-                        closeDrawer()
-                        scope.launch { openPath(ctx, ws, path) }
-                    },
-                    onNavigate = { r -> closeDrawer(); onNavigate(r) },
-                    onPickFolder = { guardedOpenFolder() },
-                )
+            key(drawerEpoch) {
+                GitexDrawer(open = drawerOpen, onClose = { closeDrawer() }) {
+                    ExplorerDrawerContent(
+                        ws, st,
+                        onClose = { closeDrawer() },
+                        onOpenFile = { path ->
+                            closeDrawer()
+                            scope.launch { openPath(ctx, ws, path) }
+                        },
+                        onNavigate = { r -> closeDrawer(); onNavigate(r) },
+                        onPickFolder = { guardedOpenFolder() },
+                    )
+                }
             }
         }
     }
 
-    // ---- GitHub connect ----
     GitHubConnectFlow(active = connecting) { connecting = false }
 
     // ---- dialogs ----
@@ -501,13 +647,29 @@ fun MainScreen(
         GDialog(
             onDismiss = { dGit = null }, title = "Unsaved changes",
             actions = listOf(
-                DialogBtn("Save all", { dGit = null; saveAllThen { runGit(commit) } }),
-                DialogBtn(if (commit) "Commit" else "Push", { dGit = null; runGit(commit) }, primary = true),
+                DialogBtn("Save all", { dGit = null; saveAllThen { launchGit(commit) } }),
+                DialogBtn(if (commit) "Commit" else "Push", { dGit = null; launchGit(commit) }, primary = true),
             )
         ) {
             GText(
                 "Some files have changes that aren't saved to disk. Save all saves them first; " +
                     "${if (commit) "Commit" else "Push"} uses the content as it is in the editor.",
+                color = Gx.textDim
+            )
+        }
+    }
+    dLarge?.let { (commit, files, bytes) ->
+        GDialog(
+            onDismiss = { dLarge = null }, title = "This folder is large",
+            actions = listOf(DialogBtn(if (commit) "Commit anyway" else "Push anyway", {
+                dLarge = null
+                ws.projectRoot?.let { largeOk.add(it.absolutePath) }
+                runGit(commit)
+            }, primary = true))
+        ) {
+            GText(
+                "It holds about $files files (${fmtSize(bytes)}). The first push uploads all of it, which can take very long on a phone. " +
+                    "A project folder with only your code is usually better.",
                 color = Gx.textDim
             )
         }
@@ -623,7 +785,7 @@ fun MainScreen(
             }
         }
         GDialog(onDismiss = { dRepo = 0 }, title = "Repository", actions = listOf(DialogBtn("Save", save, primary = true))) {
-            GText("The GitHub repository this project pushes to, and its branch.", style = Ty.small, color = Gx.textDim)
+            GText("The GitHub repository this project pushes to, and its branch. A branch that doesn't exist yet is created on the first push.", style = Ty.small, color = Gx.textDim)
             Spacer(Modifier.height(10.dp))
             err?.let { GText(it, style = Ty.small, color = Gx.danger, modifier = Modifier.padding(bottom = 6.dp)) }
             GInput(repo, { repo = it; err = null }, Modifier.fillMaxWidth(), placeholder = "Repository name", error = err != null, imeAction = ImeAction.Next)
