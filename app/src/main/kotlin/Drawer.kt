@@ -1,5 +1,6 @@
 package app.gitex
 
+import android.os.SystemClock
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.animate
@@ -85,7 +86,6 @@ class ExplorerState {
     val expanded = mutableStateListOf<String>()
     var highlighted by mutableStateOf<String?>(null)
     var mode by mutableStateOf(XMode.Normal)
-    /** Create: the folder to create in. Rename: the item being renamed. */
     var target by mutableStateOf<File?>(null)
     var createDir by mutableStateOf(false)
     val selected = mutableStateListOf<String>()
@@ -111,7 +111,6 @@ class ExplorerState {
         searching = false
     }
 
-    /** Expand every folder above [file] and highlight it. */
     fun reveal(file: File, root: File) {
         val r = root.absolutePath
         var p = file.parentFile
@@ -142,10 +141,19 @@ private fun flatten(root: File, expanded: Set<String>): List<XRow.Item> {
     return out
 }
 
+/** Create: the input row goes at the top of the target folder. Rename: the input replaces the row itself. */
 private fun withInput(rows: List<XRow.Item>, root: File?, st: ExplorerState): List<XRow> {
     if ((st.mode != XMode.Create && st.mode != XMode.Rename) || root == null) return rows
-    val parent = (if (st.mode == XMode.Create) st.target else st.target?.parentFile) ?: return rows
-    val isDir = if (st.mode == XMode.Create) st.createDir else st.target?.isDirectory == true
+    if (st.mode == XMode.Rename) {
+        val t = st.target ?: return rows
+        val idx = rows.indexOfFirst { it.file.absolutePath == t.absolutePath }
+        if (idx < 0) return rows
+        val out = ArrayList<XRow>(rows)
+        out[idx] = XRow.Input(rows[idx].depth, rows[idx].isDir)
+        return out
+    }
+    val parent = st.target ?: return rows
+    val isDir = st.createDir
     if (parent.absolutePath == root.absolutePath) return listOf<XRow>(XRow.Input(0, isDir)) + rows
     val idx = rows.indexOfFirst { it.file.absolutePath == parent.absolutePath }
     if (idx < 0) return rows
@@ -156,7 +164,6 @@ private fun withInput(rows: List<XRow.Item>, root: File?, st: ExplorerState): Li
     return out
 }
 
-/** Folders whose every visible file is selected (shown highlighted; the folder itself is not selected). */
 private fun fullyChecked(rows: List<XRow.Item>, sel: Set<String>): Set<String> {
     if (sel.isEmpty()) return emptySet()
     val res = HashSet<String>()
@@ -181,13 +188,17 @@ private fun fullyChecked(rows: List<XRow.Item>, sel: Set<String>): Set<String> {
 
 @Composable
 fun GitexDrawer(open: Boolean, onClose: () -> Unit, content: @Composable () -> Unit) {
+    val openedAt = remember { SystemClock.uptimeMillis() }
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val panelW = maxWidth * 0.95f
         val panelPx = with(LocalDensity.current) { panelW.toPx() }
         val anim = remember(panelPx) { Animatable(-panelPx) }
         var drag by remember { mutableFloatStateOf(0f) }
 
-        LaunchedEffect(open, panelPx) { anim.animateTo(if (open) 0f else -panelPx, tween(220)) }
+        LaunchedEffect(open, panelPx) {
+            if (open) drag = 0f
+            anim.animateTo(if (open) 0f else -panelPx, tween(220))
+        }
 
         val x = (anim.value + drag).coerceIn(-panelPx, 0f)
         if (!(open || x > -panelPx + 1f)) return@BoxWithConstraints
@@ -204,7 +215,6 @@ fun GitexDrawer(open: Boolean, onClose: () -> Unit, content: @Composable () -> U
             }
         }
 
-        // The explorer scrolls sideways first; whatever it cannot use drags the drawer shut.
         val conn = remember(panelPx) {
             object : NestedScrollConnection {
                 override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
@@ -234,7 +244,12 @@ fun GitexDrawer(open: Boolean, onClose: () -> Unit, content: @Composable () -> U
         Box(
             Modifier.fillMaxSize()
                 .background(Color.Black.copy(alpha = 0.5f * progress))
-                .pointerInput(Unit) { detectTapGestures { onClose() } }
+                .pointerInput(Unit) {
+                    detectTapGestures {
+                        // Ignore the tail of the very touch that opened the drawer.
+                        if (SystemClock.uptimeMillis() - openedAt > 350) onClose()
+                    }
+                }
         )
         Box(
             Modifier
@@ -546,7 +561,7 @@ fun ExplorerDrawerContent(
                 }
             }
 
-            // ---- floating search results (clear accent border + glow so it stands out) ----
+            // ---- floating search results ----
             if (st.searching && root != null) {
                 val files by produceState(emptyList<File>(), root, ws.treeVersion) { value = ws.projectFiles() }
                 val q = st.query.text.trim()
