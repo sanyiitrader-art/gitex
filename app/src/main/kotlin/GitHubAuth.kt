@@ -60,7 +60,7 @@ object Http {
  */
 object GitHubAuth {
     /** Public OAuth client id. The workflow can override it with the GITEX_CLIENT_ID repo variable. */
-    private const val DEFAULT_CLIENT_ID = "Ov23liKP6ILxzLnJKgCV"
+    private const val DEFAULT_CLIENT_ID = "Ov23liFijOTyYvaxiFOa"
 
     val clientId: String get() = BuildConfig.GITHUB_CLIENT_ID.ifBlank { DEFAULT_CLIENT_ID }
 
