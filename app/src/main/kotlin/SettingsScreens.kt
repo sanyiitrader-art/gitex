@@ -101,10 +101,15 @@ private fun Dropdown(
 @Composable
 fun SettingsHomeScreen(onBack: () -> Unit, onNavigate: (Route) -> Unit) {
     Page("Settings", onBack) {
-        SettingCard(Ico.Code, "Editor", "Font, highlighting, indentation and smart actions", glow = true) { onNavigate(Route.SetEditor) }
-        SettingCard(Ico.Palette, "Appearance", "Themes, UI temperature and code colours", glow = true) { onNavigate(Route.SetAppearance) }
-        SettingCard(Ico.Github, "GitHub", "Account, Git identity and notifications", glow = true) { onNavigate(Route.SetGithub) }
-        SettingCard(Ico.Delete, "Recycle Bin", "Restore or permanently delete removed items", glow = true) { onNavigate(Route.Recycle) }
+        // Named onClick matters: a trailing lambda here would be taken as the card's content slot.
+        SettingCard(Ico.Code, "Editor", "Font, highlighting, indentation and smart actions",
+            glow = true, onClick = { onNavigate(Route.SetEditor) })
+        SettingCard(Ico.Palette, "Appearance", "Themes, UI temperature and code colours",
+            glow = true, onClick = { onNavigate(Route.SetAppearance) })
+        SettingCard(Ico.Github, "GitHub", "Account, Git identity and notifications",
+            glow = true, onClick = { onNavigate(Route.SetGithub) })
+        SettingCard(Ico.Delete, "Recycle Bin", "Restore or permanently delete removed items",
+            glow = true, onClick = { onNavigate(Route.Recycle) })
     }
 }
 
