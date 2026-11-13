@@ -20,8 +20,8 @@ import org.eclipse.jgit.dircache.DirCacheEntry
 import org.eclipse.jgit.errors.NoRemoteRepositoryException
 import org.eclipse.jgit.lib.Constants
 import org.eclipse.jgit.lib.FileMode
-import org.eclipse.jgit.lib.NullProgressMonitor
 import org.eclipse.jgit.lib.ObjectId
+import org.eclipse.jgit.lib.ProgressMonitor
 import org.eclipse.jgit.lib.Repository
 import org.eclipse.jgit.lib.RepositoryState
 import org.eclipse.jgit.storage.file.WindowCacheConfig
@@ -30,6 +30,7 @@ import org.eclipse.jgit.transport.RemoteRefUpdate
 import org.eclipse.jgit.transport.UsernamePasswordCredentialsProvider
 import org.json.JSONObject
 import java.io.File
+import java.lang.reflect.Proxy
 import java.net.ConnectException
 import java.net.SocketException
 import java.net.SocketTimeoutException
@@ -93,25 +94,38 @@ object Net {
     }
 }
 
-/** Reports progress and lets JGit stop quickly when the coroutine is cancelled. */
-private class Mon(val job: Job?, val onStatus: (String) -> Unit, val verb: String) : NullProgressMonitor() {
-    private var total = 0
-    private var done = 0
-    private var lastPct = -1
-    override fun beginTask(title: String?, totalWork: Int) {
-        total = totalWork; done = 0; lastPct = -1
-        onStatus(if (totalWork > 0) "$verb 0%" else "$verb…")
-    }
-
-    override fun update(completed: Int) {
-        done += completed
-        if (total > 0) {
-            val p = (done.toLong() * 100 / total).toInt().coerceIn(0, 100)
-            if (p != lastPct) { lastPct = p; onStatus("$verb $p%") }
+/**
+ * Progress listener for JGit: reports "Uploading 42%" style status and lets JGit stop quickly when the
+ * coroutine is cancelled. Built on JGit's public ProgressMonitor interface through a dynamic proxy, so it
+ * does not depend on which methods a given JGit version declares.
+ */
+private fun monitor(job: Job?, onStatus: (String) -> Unit, verb: String): ProgressMonitor {
+    var total = 0
+    var done = 0
+    var lastPct = -1
+    return Proxy.newProxyInstance(
+        ProgressMonitor::class.java.classLoader, arrayOf(ProgressMonitor::class.java)
+    ) { _, method, args ->
+        when (method.name) {
+            "beginTask" -> {
+                total = (args?.getOrNull(1) as? Int) ?: 0
+                done = 0
+                lastPct = -1
+                onStatus(if (total > 0) "$verb 0%" else "$verb…")
+                null
+            }
+            "update" -> {
+                done += (args?.getOrNull(0) as? Int) ?: 0
+                if (total > 0) {
+                    val p = (done.toLong() * 100 / total).toInt().coerceIn(0, 100)
+                    if (p != lastPct) { lastPct = p; onStatus("$verb $p%") }
+                }
+                null
+            }
+            "isCancelled" -> job?.isActive == false
+            else -> if (method.returnType == java.lang.Boolean.TYPE) false else null
         }
-    }
-
-    override fun isCancelled(): Boolean = job?.isActive == false
+    } as ProgressMonitor
 }
 
 /**
@@ -410,7 +424,7 @@ object GitOps {
             val spec = RefSpec("refs/heads/$b:refs/heads/$b").setForceUpdate(force)
             val results = git.push().setRemote("origin").setRefSpecs(spec).setForce(force)
                 .setCredentialsProvider(creds(link)).setTimeout(60)
-                .setProgressMonitor(Mon(job, onStatus, "Uploading")).call()
+                .setProgressMonitor(monitor(job, onStatus, "Uploading")).call()
             var upToDate = false
             var ok = false
             for (r in results) {
@@ -466,7 +480,7 @@ object GitOps {
             stageAndCommit(git, root, message, buffers, onStatus)
             onStatus("Fetching from GitHub…")
             git.fetch().setRemote("origin").setCredentialsProvider(creds(link)).setTimeout(60)
-                .setProgressMonitor(Mon(job, onStatus, "Fetching")).call()
+                .setProgressMonitor(monitor(job, onStatus, "Fetching")).call()
             val repo = git.repository
             val remote = repo.resolve("refs/remotes/origin/${link.branch}") ?: return MergeOutcome.NoRemoteBranch
             val before = repo.resolve("HEAD") ?: return MergeOutcome.Failed("There is nothing local to merge into.")
