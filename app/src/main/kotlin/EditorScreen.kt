@@ -34,6 +34,7 @@ import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -48,6 +49,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
@@ -76,10 +78,11 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
 import androidx.compose.ui.zIndex
-import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import kotlin.math.roundToInt
 
@@ -214,6 +217,167 @@ private fun TopActionButton(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Project Store browser (shown on the same surface as the start-screen buttons)
+// ---------------------------------------------------------------------------
+
+private class StoreItem(
+    val file: File, val isDir: Boolean, val isGit: Boolean,
+    val modified: Long, val opened: Long, val len: Long,
+)
+
+private fun listStore(dir: File): List<StoreItem> {
+    val kids = dir.listFiles() ?: return emptyList()
+    val items = kids
+        .filter { !Fs.isHiddenName(it.name) && (StorePrefs.showHidden || !it.name.startsWith(".")) }
+        .map {
+            StoreItem(
+                it, it.isDirectory, it.isDirectory && File(it, ".git").exists(),
+                it.lastModified(), StorePrefs.openedAt(it.absolutePath), if (it.isFile) it.length() else 0L
+            )
+        }
+    val byName = compareBy<StoreItem> { it.file.name.lowercase() }
+    val order: Comparator<StoreItem> = when (StorePrefs.sort) {
+        "opened" -> compareByDescending<StoreItem> { it.opened }.thenBy { it.file.name.lowercase() }
+        "changed" -> compareByDescending<StoreItem> { it.modified }.thenBy { it.file.name.lowercase() }
+        else -> byName
+    }
+    return items.sortedWith(compareBy<StoreItem> { !it.isDir }.then(order))
+}
+
+private fun ageText(ms: Long): String {
+    if (ms <= 0) return ""
+    val d = (System.currentTimeMillis() - ms) / 1000
+    return when {
+        d < 60 -> "just now"
+        d < 3600 -> "${d / 60} min ago"
+        d < 86400 -> "${d / 3600} h ago"
+        d < 86400L * 30 -> "${d / 86400} d ago"
+        else -> "${d / (86400L * 30)} mo ago"
+    }
+}
+
+@Composable
+private fun StoreChip(text: String, color: Color) {
+    Box(
+        Modifier.clip(RoundedCornerShape(50)).background(color.copy(alpha = 0.16f))
+            .border(1.dp, color.copy(alpha = 0.6f), RoundedCornerShape(50))
+            .padding(horizontal = 8.dp, vertical = 2.dp)
+    ) { GText(text, style = Ty.tiny.copy(fontWeight = FontWeight.SemiBold), color = color, maxLines = 1) }
+}
+
+@Composable
+private fun StoreBrowser(
+    ws: Workspace,
+    onProject: (File) -> Unit,
+    onFile: (File) -> Unit,
+    onClose: () -> Unit,
+    onSettings: () -> Unit,
+) {
+    val store = StorePrefs.dir()
+    val ok = StorePrefs.available()
+    var refresh by remember { mutableIntStateOf(0) }
+    var newDlg by remember { mutableStateOf(false) }
+    val items by produceState<List<StoreItem>?>(
+        null, store?.absolutePath, refresh, ws.treeVersion, StorePrefs.sort, StorePrefs.showHidden
+    ) {
+        value = if (store == null || !ok) emptyList() else withContext(Dispatchers.IO) { listStore(store) }
+    }
+    val list = items
+    val currentRoot = ws.projectRoot?.absolutePath
+
+    Column(Modifier.fillMaxSize()) {
+        Row(
+            Modifier.fillMaxWidth().padding(start = 16.dp, end = 6.dp, top = 8.dp, bottom = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(Modifier.weight(1f)) {
+                GText("Project Store", style = Ty.heading, maxLines = 1)
+                GText(store?.absolutePath ?: "Not set", style = Ty.tiny, color = Gx.textDim, maxLines = 1)
+            }
+            GButton("New project", onClick = { newDlg = true }, enabled = ok && store?.canWrite() == true, height = 40.dp, glow = false)
+            Spacer(Modifier.width(4.dp))
+            IconBtn(Ico.Close, onClose)
+        }
+        Box(Modifier.fillMaxWidth().height(1.dp).background(Gx.border))
+        when {
+            store == null -> Column(
+                Modifier.fillMaxSize().padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center
+            ) {
+                GText("No Project Store yet", color = Gx.textDim)
+                Spacer(Modifier.height(14.dp))
+                GButton("Choose a store folder", onClick = onSettings)
+            }
+            !ok -> Column(
+                Modifier.fillMaxSize().padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center
+            ) {
+                GText("The store folder isn't available right now.", color = Gx.textDim)
+                Spacer(Modifier.height(14.dp))
+                GButton("Open Project Store settings", onClick = onSettings)
+            }
+            list == null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { GSpinner() }
+            list.isEmpty() -> EmptyNote("The store is empty. Tap \"New project\" to create your first project.")
+            else -> LazyColumn(
+                Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                items(list, key = { it.file.absolutePath }) { it ->
+                    val isCurrent = it.isDir && it.file.absolutePath == currentRoot
+                    GCard(
+                        Modifier.fillMaxWidth(),
+                        selected = isCurrent,
+                        onClick = { if (it.isDir) onProject(it.file) else onFile(it.file) },
+                        padding = PaddingValues(horizontal = 12.dp, vertical = 11.dp)
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            if (it.isDir) FolderIcon(it.file.name, size = 28.dp) else FileIcon(it.file.name, size = 28.dp)
+                            Spacer(Modifier.width(12.dp))
+                            Column(Modifier.weight(1f)) {
+                                GText(it.file.name, maxLines = 1)
+                                val sub = if (it.isDir) {
+                                    if (StorePrefs.sort == "opened" && it.opened > 0) "opened ${ageText(it.opened)}"
+                                    else "changed ${ageText(it.modified)}"
+                                } else "${fmtSize(it.len)} · ${ageText(it.modified)}"
+                                GText(sub, style = Ty.tiny, color = Gx.textDim, maxLines = 1)
+                            }
+                            if (it.isGit) {
+                                Spacer(Modifier.width(6.dp))
+                                StoreChip("git", Gx.textDim)
+                            }
+                            if (isCurrent) {
+                                Spacer(Modifier.width(6.dp))
+                                StoreChip("open", Gx.accent)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (newDlg && store != null) {
+        var name by remember { mutableStateOf(TextFieldValue("")) }
+        var err by remember { mutableStateOf<String?>(null) }
+        val create = {
+            val e = Fs.nameError(name.text, store)
+            if (e != null) err = e
+            else {
+                Fs.createDir(store, name.text)
+                    .onSuccess { newDlg = false; refresh++; onProject(it) }
+                    .onFailure { err = Fs.friendly(it) }
+            }
+        }
+        GDialog(onDismiss = { newDlg = false }, title = "New project", actions = listOf(DialogBtn("Create", create, primary = true))) {
+            GText("A new folder is created in the store and opened as your project.", style = Ty.small, color = Gx.textDim)
+            Spacer(Modifier.height(10.dp))
+            err?.let { GText(it, style = Ty.small, color = Gx.danger, modifier = Modifier.padding(bottom = 6.dp)) }
+            GInput(name, { name = it; err = null }, Modifier.fillMaxWidth(), placeholder = "Project name", error = err != null, onDone = create)
+        }
+    }
+}
+
 @Composable
 fun MainScreen(
     ws: Workspace,
@@ -222,6 +386,7 @@ fun MainScreen(
     onNavigate: (Route) -> Unit,
     onPickFolder: () -> Unit,
     onPickFile: () -> Unit,
+    onPickImage: () -> Unit,
 ) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -236,12 +401,13 @@ fun MainScreen(
     var topH by remember { mutableIntStateOf(0) }
     var panelRect by remember { mutableStateOf<Rect?>(null) }
     val mdOn = remember { mutableStateMapOf<String, Boolean>() }
+    var storeOpen by remember { mutableStateOf(false) }
 
     var dReplace by remember { mutableStateOf(false) }
     var dGoto by remember { mutableStateOf(false) }
     var dRepo by remember { mutableIntStateOf(0) }            // 0 none, 1 edit, 2 push, 3 commit
     var dCloseFile by remember { mutableStateOf<String?>(null) }
-    var dFolderGuard by remember { mutableStateOf(false) }
+    var folderAction by remember { mutableStateOf<(() -> Unit)?>(null) }
     var dGit by remember { mutableStateOf<Boolean?>(null) }   // null none, false push, true commit
     var dConflict by remember { mutableStateOf<String?>(null) }
 
@@ -263,9 +429,11 @@ fun MainScreen(
     val textFile = buf != null && buf.kind == FileKind.TEXT
     val imeVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
     val gitBusy = pushState == 1 || committing
+    val storeSet = StorePrefs.dir() != null
 
     fun closeDrawer() { st.cancel(); st.searching = false; drawerOpen = false }
 
+    BackHandler(storeOpen) { storeOpen = false }
     BackHandler(drawerOpen) { closeDrawer() }
     BackHandler(recentsOpen && !drawerOpen) { recentsOpen = false }
 
@@ -294,8 +462,23 @@ fun MainScreen(
         if (ws.dirty[path] == true) dCloseFile = path else scope.launch { ws.close(path) }
     }
 
-    fun guardedOpenFolder() {
-        if (ws.hasDirty()) dFolderGuard = true else onPickFolder()
+    /** Runs [action] (switching to another project folder) after asking about unsaved changes. */
+    fun guarded(action: () -> Unit) {
+        if (ws.hasDirty()) folderAction = action else action()
+    }
+
+    fun guardedOpenFolder() = guarded(onPickFolder)
+
+    fun openProject(f: File) {
+        guarded {
+            ws.setProject(f)
+            st.reset()
+            StorePrefs.markOpened(f.absolutePath)
+            storeOpen = false
+            Banners.show("Opened ${f.name}")
+            drawerEpoch++
+            drawerOpen = true
+        }
     }
 
     // ---- Git ----
@@ -460,6 +643,13 @@ fun MainScreen(
 
             Box(Modifier.weight(1f).fillMaxWidth()) {
                 when {
+                    storeOpen -> StoreBrowser(
+                        ws,
+                        onProject = { openProject(it) },
+                        onFile = { f -> scope.launch { if (openPath(ctx, ws, f.absolutePath)) storeOpen = false } },
+                        onClose = { storeOpen = false },
+                        onSettings = { storeOpen = false; onNavigate(Route.SetStore) }
+                    )
                     buf == null || cur == null -> Column(
                         Modifier.fillMaxSize().padding(32.dp),
                         horizontalAlignment = Alignment.CenterHorizontally,
@@ -468,8 +658,15 @@ fun MainScreen(
                         GButton("Select Folder", onClick = { guardedOpenFolder() }, modifier = Modifier.fillMaxWidth(), glow = true)
                         Spacer(Modifier.height(16.dp))
                         GButton("Open file", onClick = onPickFile, modifier = Modifier.fillMaxWidth(), primary = false, glow = true)
+                        if (storeSet && StorePrefs.showOnStart) {
+                            Spacer(Modifier.height(16.dp))
+                            GButton("Choose from store", onClick = { storeOpen = true }, modifier = Modifier.fillMaxWidth(), primary = false, glow = true)
+                        }
                     }
-                    buf.kind == FileKind.IMAGE -> ImageViewer(cur)
+                    buf.kind == FileKind.IMAGE -> ImageViewer(
+                        cur, ws.treeVersion,
+                        onReplace = { ReplaceState.target = File(cur); onPickImage() }
+                    )
                     mdMode -> {
                         val text = remember(cur, mdMode, ws.contentVersion) { buf.content?.toString() ?: "" }
                         MarkdownPreview(text)
@@ -477,7 +674,7 @@ fun MainScreen(
                     else -> CodeEditorView(buf, ws, handle, Modifier.fillMaxSize())
                 }
             }
-            if (imeVisible && textFile && !mdMode) SpecialKeysBar(handle)
+            if (imeVisible && textFile && !mdMode && !storeOpen) SpecialKeysBar(handle)
         }
 
         // recent files panel
@@ -503,7 +700,7 @@ fun MainScreen(
                             GCard(
                                 Modifier.width(150.dp).height(40.dp),
                                 selected = on,
-                                onClick = { scope.launch { openPath(ctx, ws, path) } },
+                                onClick = { storeOpen = false; scope.launch { openPath(ctx, ws, path) } },
                                 shape = Shapes.small,
                                 padding = PaddingValues(start = 10.dp, end = 2.dp)
                             ) {
@@ -576,6 +773,7 @@ fun MainScreen(
                                         MItem("Commit", enabled = !gitBusy) { startGit(true) },
                                         MItem("Open File") { onPickFile() },
                                         MItem("Open Folder") { guardedOpenFolder() },
+                                        MItem("Open from store", enabled = storeSet) { storeOpen = true },
                                     ),
                                     "Editor" to listOf(
                                         MItem("Search in file", enabled = hasText) { onNavigate(Route.SearchFile) },
@@ -609,6 +807,7 @@ fun MainScreen(
                         onClose = { closeDrawer() },
                         onOpenFile = { path ->
                             closeDrawer()
+                            storeOpen = false
                             scope.launch { openPath(ctx, ws, path) }
                         },
                         onNavigate = { r -> closeDrawer(); onNavigate(r) },
@@ -620,6 +819,7 @@ fun MainScreen(
     }
 
     GitHubConnectFlow(active = connecting) { connecting = false }
+    ReplaceImageDialog(ws)
 
     // ---- dialogs ----
     dCloseFile?.let { path ->
@@ -631,15 +831,15 @@ fun MainScreen(
             )
         ) { GText("\"${File(path).name}\" has changes that haven't been saved.", color = Gx.textDim) }
     }
-    if (dFolderGuard) {
+    folderAction?.let { act ->
         GDialog(
-            onDismiss = { dFolderGuard = false }, title = "Unsaved changes",
+            onDismiss = { folderAction = null }, title = "Unsaved changes",
             actions = listOf(
                 DialogBtn("Discard", {
-                    dFolderGuard = false
-                    scope.launch { for (p in ws.dirtyPaths()) ws.close(p); onPickFolder() }
+                    folderAction = null
+                    scope.launch { for (p in ws.dirtyPaths()) ws.close(p); act() }
                 }, danger = true),
-                DialogBtn("Save all", { dFolderGuard = false; saveAllThen { onPickFolder() } }, primary = true),
+                DialogBtn("Save all", { folderAction = null; saveAllThen { act() } }, primary = true),
             )
         ) { GText("Some open files have changes that haven't been saved.", color = Gx.textDim) }
     }
