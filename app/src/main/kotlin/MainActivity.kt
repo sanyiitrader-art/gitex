@@ -76,7 +76,7 @@ class MainActivity : ComponentActivity() {
 
 enum class Route {
     Onboarding, Welcome, Main, SearchFile, SearchProject,
-    Settings, SetEditor, SetAppearance, SetTheme, SetGithub, SetAi, Recycle, Actions, Log
+    Settings, SetEditor, SetAppearance, SetTheme, SetGithub, SetAi, SetStore, Recycle, Actions, Log
 }
 
 @Composable
@@ -168,7 +168,18 @@ fun GitexRoot() {
             } else {
                 ws.setProject(dir)
                 explorer.reset()
+                StorePrefs.markOpened(dir.absolutePath)
                 Banners.show("Opened ${dir.name}")
+            }
+        }
+    }
+    val storeLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) {
+            val dir = Fs.pathFromTree(uri)
+            if (dir == null) {
+                Banners.show("Gitex can't reach that location. Choose a folder in your phone's storage.", BannerKind.Error)
+            } else {
+                StoreState.pending = dir // the Project Store screen explains it and waits for "Agree"
             }
         }
     }
@@ -180,6 +191,9 @@ fun GitexRoot() {
                 else openPath(ctx, ws, f.absolutePath)
             }
         }
+    }
+    val imageLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) ReplaceState.picked = uri else ReplaceState.target = null
     }
 
     DeadTapHost {
@@ -198,6 +212,7 @@ fun GitexRoot() {
                     onNavigate = { go(it) },
                     onPickFolder = { folderLauncher.launch(null) },
                     onPickFile = { fileLauncher.launch(arrayOf("*/*")) },
+                    onPickImage = { imageLauncher.launch(arrayOf("image/*")) },
                 )
                 Route.SearchFile -> SearchInFileScreen(ws, onClose = { back() }) { line, col, len ->
                     ws.current?.let { handle.pendingJump = EditorHandle.Jump(it, line, col, len) }
@@ -217,6 +232,7 @@ fun GitexRoot() {
                 Route.SetTheme -> ThemePickerScreen { back() }
                 Route.SetGithub -> GitHubSettingsScreen { back() }
                 Route.SetAi -> AiSettingsScreen { back() }
+                Route.SetStore -> StoreSettingsScreen(onBack = { back() }, onChoose = { storeLauncher.launch(null) })
                 Route.Recycle -> RecycleBinScreen(ws) { back() }
                 Route.Actions -> ActionsScreen(ws, onBack = { back() }, onOpenLog = { run ->
                     ActionsNav.logRepo = run.fullName
