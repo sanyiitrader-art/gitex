@@ -13,6 +13,7 @@ import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.setValue
 import org.json.JSONArray
 import org.json.JSONObject
+import java.security.GeneralSecurityException
 import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
@@ -61,6 +62,9 @@ object Prefs {
     private fun intP(k: String, d: Int) = PrefValue<Int>(
         k, d, { s, key, def -> s.getInt(key, def) }, { e, key, v -> e.putInt(key, v) })
 
+    private fun longP(k: String, d: Long) = PrefValue<Long>(
+        k, d, { s, key, def -> s.getLong(key, def) }, { e, key, v -> e.putLong(key, v) })
+
     private fun floatP(k: String, d: Float) = PrefValue<Float>(
         k, d, { s, key, def -> s.getFloat(key, def) }, { e, key, v -> e.putFloat(key, v) })
 
@@ -94,6 +98,8 @@ object Prefs {
     var gitEmail by strP("git_email", "")
     var buildNotifications by boolP("build_notifications", true)
     var duplicateWarnings by boolP("duplicate_warnings", true)
+    /** When GitHub says the saved sign-in ends (epoch ms), or 0 if it doesn't expire. */
+    var tokenExpiresAt by longP("token_expires_at", 0L)
 
     // ---- workspace ----
     var projectRoot by strP("project_root", "")
@@ -152,7 +158,7 @@ object Prefs {
     // ---- repository association per project folder ----
     fun repoLink(root: String): RepoLink? = links[root]
 
-    /** All associations, used for the global artifact history in Phase 2. */
+    /** All associations, used for the global artifact history. */
     fun allRepoLinks(): List<RepoLink> = links.values.toList()
 
     fun setRepoLink(root: String, link: RepoLink?) {
@@ -181,11 +187,13 @@ object Prefs {
 
     fun saveGithubToken(token: String) {
         SecureStore.put(K_TOKEN, token)
+        tokenExpiresAt = GitHubAuth.takePendingExpiry()
         githubConnected = SecureStore.get(K_TOKEN) != null
     }
 
     fun clearGithubToken() {
         SecureStore.put(K_TOKEN, null)
+        tokenExpiresAt = 0L
         githubConnected = false
     }
 
@@ -196,11 +204,17 @@ object Prefs {
     }
 }
 
-/** AES-256-GCM with a key that lives in the Android Keystore. Values are stored as Base64(iv + ciphertext). */
+/**
+ * AES-256-GCM with a key that lives in the Android Keystore. Values are stored as Base64(iv + ciphertext).
+ * Decrypted values are kept in memory. A value is only deleted when it is truly unreadable
+ * (wrong key / damaged data), never because of a temporary Keystore error.
+ */
 object SecureStore {
     private const val ALIAS = "gitex_secret_key_v1"
     private const val TRANSFORM = "AES/GCM/NoPadding"
     private const val IV_LEN = 12
+
+    private val cache = HashMap<String, String>()
 
     private val sp: SharedPreferences
         get() = App.instance.getSharedPreferences("gitex_secure", Context.MODE_PRIVATE)
@@ -226,12 +240,14 @@ object SecureStore {
         val e = sp.edit()
         if (value == null) {
             e.remove(name)
+            cache.remove(name)
         } else {
             try {
                 val c = Cipher.getInstance(TRANSFORM)
                 c.init(Cipher.ENCRYPT_MODE, key())
                 val ct = c.doFinal(value.toByteArray(Charsets.UTF_8))
                 e.putString(name, Base64.encodeToString(c.iv + ct, Base64.NO_WRAP))
+                cache[name] = value
             } catch (_: Exception) {
                 return // never fall back to storing a secret unencrypted
             }
@@ -241,15 +257,21 @@ object SecureStore {
 
     @Synchronized
     fun get(name: String): String? {
+        cache[name]?.let { return it }
         val stored = sp.getString(name, null) ?: return null
         return try {
             val raw = Base64.decode(stored, Base64.NO_WRAP)
             val c = Cipher.getInstance(TRANSFORM)
             c.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, raw, 0, IV_LEN))
-            String(c.doFinal(raw, IV_LEN, raw.size - IV_LEN), Charsets.UTF_8)
-        } catch (_: Exception) {
-            // Key was invalidated or data is corrupt: drop it so the user can reconnect.
+            val v = String(c.doFinal(raw, IV_LEN, raw.size - IV_LEN), Charsets.UTF_8)
+            cache[name] = v
+            v
+        } catch (_: GeneralSecurityException) {
+            // The key no longer matches the data: it can never be read again, so drop it.
             sp.edit().remove(name).apply()
+            null
+        } catch (_: Exception) {
+            // Temporary problem (Keystore busy ...): keep the stored value and try again next time.
             null
         }
     }
