@@ -92,6 +92,12 @@ private fun setScheme(cs: EditorColorScheme, name: String, argb: Int) {
     if (id >= 0) try { cs.setColor(id, argb) } catch (_: Throwable) { }
 }
 
+/** Languages where < > are brackets (generics, includes, tags). */
+private val ANGLE_LANGS = setOf(
+    "html", "xml", "vue", "svelte", "cpp", "c", "java", "kotlin", "typescript", "tsx", "javascript",
+    "csharp", "swift", "rust", "dart", "scala"
+)
+
 // ---------------------------------------------------------------------------
 // Highlighting, bracket pairs and indentation guides
 // ---------------------------------------------------------------------------
@@ -192,7 +198,8 @@ class LexAnalyzer(
             val col = d.col[i]
             val k = d.kind[i].toInt()
             val st = tok[k]
-            if (k == Tok.PLAIN && (line == aL || line == bL)) {
+            // Brackets live in PLAIN spans; in markup, tag brackets live inside KEYWORD spans.
+            if ((k == Tok.PLAIN || k == Tok.KEYWORD) && (line == aL || line == bL)) {
                 val end = if (i + 1 < d.n && d.line[i + 1] == line) d.col[i + 1] else Int.MAX_VALUE
                 var c1 = -1
                 var c2 = -1
@@ -241,7 +248,15 @@ class LexAnalyzer(
         }
     }
 
+    /**
+     * Bracket matching that ignores brackets inside strings and comments. ( ) [ ] { } come from PLAIN tokens.
+     * < > count too in languages that use them: in markup they are the tag brackets (KEYWORD tokens);
+     * elsewhere a "<" only counts when a name follows it, and "->", "=>" and comparisons are left alone.
+     */
     private fun findBrackets(text: CharSequence, d: SpanData): BracketData {
+        val l = lang
+        val markup = l?.markup == true
+        val angle = l != null && (markup || l.id in ANGLE_LANGS)
         val ls = ArrayList<Int>()
         val cs = ArrayList<Int>()
         val chs = ArrayList<Char>()
@@ -249,27 +264,44 @@ class LexAnalyzer(
         var line = 0
         var col = 0
         var kind = Tok.PLAIN
-        for (i in 0 until text.length) {
+        val n = text.length
+        for (i in 0 until n) {
             while (si < d.n && (d.line[si] < line || (d.line[si] == line && d.col[si] <= col))) {
                 kind = d.kind[si].toInt(); si++
             }
             val ch = text[i]
             if (ch == '\n') { line++; col = 0; continue }
-            if (kind == Tok.PLAIN && (ch == '(' || ch == ')' || ch == '[' || ch == ']' || ch == '{' || ch == '}')) {
-                ls.add(line); cs.add(col); chs.add(ch)
+            var take = false
+            if (ch == '(' || ch == ')' || ch == '[' || ch == ']' || ch == '{' || ch == '}') {
+                take = kind == Tok.PLAIN
+            } else if (angle && (ch == '<' || ch == '>')) {
+                val kindOk = if (markup) kind == Tok.KEYWORD else kind == Tok.PLAIN
+                if (kindOk) {
+                    val pv = if (i > 0) text[i - 1] else ' '
+                    if (ch == '<') {
+                        val nx = if (i + 1 < n) text[i + 1] else ' '
+                        take = markup || (pv != '<' && nx != '<' && nx != '=' &&
+                            (nx.isLetter() || nx == '_' || nx == '>' || nx == '?'))
+                    } else {
+                        take = pv != '-' && pv != '='
+                    }
+                }
             }
+            if (take) { ls.add(line); cs.add(col); chs.add(ch) }
             col++
         }
-        val n = ls.size
-        val match = IntArray(n) { -1 }
-        val stacks = Array(3) { ArrayList<Int>() }
-        for (i in 0 until n) {
+        val cnt = ls.size
+        val match = IntArray(cnt) { -1 }
+        val stacks = Array(4) { ArrayList<Int>() }
+        val maxGap = if (markup) 60 else 6
+        for (i in 0 until cnt) {
             val ch = chs[i]
-            val t = when (ch) { '(', ')' -> 0; '[', ']' -> 1; else -> 2 }
-            if (ch == '(' || ch == '[' || ch == '{') stacks[t].add(i)
+            val t = when (ch) { '(', ')' -> 0; '[', ']' -> 1; '{', '}' -> 2; else -> 3 }
+            val open = ch == '(' || ch == '[' || ch == '{' || ch == '<'
+            if (open) stacks[t].add(i)
             else if (stacks[t].isNotEmpty()) {
                 val o = stacks[t].removeAt(stacks[t].lastIndex)
-                match[o] = i; match[i] = o
+                if (t != 3 || ls[i] - ls[o] <= maxGap) { match[o] = i; match[i] = o }
             }
         }
         return BracketData(ls.toIntArray(), cs.toIntArray(), match)
@@ -527,19 +559,9 @@ private class Applied(var buffer: BufferState) {
     var analyzer: LexAnalyzer? = null
     var lang: LangDef? = null
     var lastCount = 0
+    var lastLen = 0
     var applying = false
 }
-
-private val ACTION_INSERT: Int = try {
-    ContentChangeEvent::class.java.getField("ACTION_INSERT").getInt(null)
-} catch (_: Throwable) {
-    1
-}
-
-private val angleLangs = setOf(
-    "html", "xml", "vue", "svelte", "cpp", "java", "kotlin", "typescript", "tsx",
-    "csharp", "swift", "rust", "dart", "scala"
-)
 
 /**
  * Smart Enter. Runs right after a new line was inserted: gives the new line the previous line's
@@ -576,6 +598,7 @@ private fun smartEnter(ed: CodeEditor, a: Applied) {
             a.applying = false
         }
         a.lastCount = t.lineCount
+        a.lastLen = t.length
     } catch (_: Throwable) {
     }
 }
@@ -604,6 +627,7 @@ private fun autoPair(ed: CodeEditor, a: Applied, c: Char, line: Int, col: Int) {
             } finally {
                 a.applying = false
             }
+            a.lastLen = t.length
             return
         }
 
@@ -618,8 +642,18 @@ private fun autoPair(ed: CodeEditor, a: Applied, c: Char, line: Int, col: Int) {
         if (quote && wordPrev) return
         if (c == '<') {
             val l = lang ?: return
-            if (l.id !in angleLangs) return
-            if (!l.markup && !wordPrev) return
+            if (!l.markup) {
+                if (l.id !in ANGLE_LANGS) return
+                val head = s.trimStart()
+                val include = head.startsWith("#include") || head.startsWith("#import")
+                val before = s.substring(0, (col - 1).coerceAtLeast(0)).trimEnd()
+                val jsx = (l.id == "tsx" || l.id == "javascript") && (
+                    prev == null || prev == '(' ||
+                        (prev.isWhitespace() && (before.endsWith("return") || before.endsWith("(") || before.endsWith("=") ||
+                            before.endsWith("=>") || before.endsWith("?") || before.endsWith(":")))
+                    )
+                if (!(wordPrev || include || jsx)) return
+            }
         }
         val nextOk = next == null || next.isWhitespace() || next in ")]}>,;:.\"'`"
         if (!nextOk) return
@@ -629,6 +663,35 @@ private fun autoPair(ed: CodeEditor, a: Applied, c: Char, line: Int, col: Int) {
             ed.setSelection(line, col)
         } finally {
             a.applying = false
+        }
+        a.lastLen = t.length
+    } catch (_: Throwable) {
+    }
+}
+
+/**
+ * Backspace on an opening bracket or quote that sits directly in front of its closer, as in (|),
+ * removes the closer too. [col] is where the deleted character used to be.
+ */
+private fun autoUnpair(ed: CodeEditor, a: Applied, deleted: Char, line: Int, col: Int) {
+    try {
+        val closer = when (deleted) {
+            '(' -> ')'; '[' -> ']'; '{' -> '}'; '"' -> '"'; '\'' -> '\''; '`' -> '`'; '<' -> '>'
+            else -> return
+        }
+        val t = ed.text
+        if (line < 0 || line >= t.lineCount) return
+        val cur = ed.cursor
+        if (cur.isSelected || cur.leftLine != line || cur.leftColumn != col) return
+        val s = t.getLineString(line)
+        if (col < s.length && s[col] == closer) {
+            a.applying = true
+            try {
+                t.delete(line, col, line, col + 1)
+            } finally {
+                a.applying = false
+            }
+            a.lastLen = t.length
         }
     } catch (_: Throwable) {
     }
@@ -668,25 +731,36 @@ fun CodeEditorView(
             ed.tag = ap
             ed.subscribeEvent(ContentChangeEvent::class.java) { ev, _ ->
                 val a = ed.tag as? Applied
-                if (a != null && !a.settingText) {
-                    ws.onEdited(a.buffer.path)
-                    handle.refreshUndo()
-                    val count = ed.text.lineCount
-                    val prevCount = a.lastCount
-                    a.lastCount = count
-                    if (!a.applying && Prefs.smartActions) {
-                        if (prevCount > 0 && count == prevCount + 1) {
-                            ed.post { smartEnter(ed, a) }
-                        } else {
-                            val act = invokeGet(ev, "getAction") as? Int
-                            val undo = invokeGet(ev, "isCausedByUndoManager") as? Boolean ?: false
-                            val txt = invokeGet(ev, "getChangedText")?.toString()
-                            val end = invokeGet(ev, "getChangeEnd")
-                            val eLine = invokeGet(end, "getLine") as? Int
-                            val eCol = invokeGet(end, "getColumn") as? Int
-                            if (act == ACTION_INSERT && !undo && txt != null && txt.length == 1 && eLine != null && eCol != null) {
-                                val ch = txt[0]
-                                ed.post { autoPair(ed, a, ch, eLine, eCol) }
+                if (a != null) {
+                    val len = ed.text.length
+                    val delta = len - a.lastLen
+                    a.lastLen = len
+                    if (!a.settingText) {
+                        ws.onEdited(a.buffer.path)
+                        handle.refreshUndo()
+                        val count = ed.text.lineCount
+                        val prevCount = a.lastCount
+                        a.lastCount = count
+                        if (!a.applying && Prefs.smartActions) {
+                            if (prevCount > 0 && count == prevCount + 1) {
+                                ed.post { smartEnter(ed, a) }
+                            } else if (delta == 1 || delta == -1) {
+                                val undo = invokeGet(ev, "isCausedByUndoManager") as? Boolean ?: false
+                                val txt = invokeGet(ev, "getChangedText")?.toString()
+                                if (!undo && txt != null && txt.length == 1) {
+                                    val ch = txt[0]
+                                    if (delta == 1) {
+                                        val end = invokeGet(ev, "getChangeEnd")
+                                        val eLine = invokeGet(end, "getLine") as? Int
+                                        val eCol = invokeGet(end, "getColumn") as? Int
+                                        if (eLine != null && eCol != null) ed.post { autoPair(ed, a, ch, eLine, eCol) }
+                                    } else {
+                                        val start = invokeGet(ev, "getChangeStart")
+                                        val sLine = invokeGet(start, "getLine") as? Int
+                                        val sCol = invokeGet(start, "getColumn") as? Int
+                                        if (sLine != null && sCol != null) ed.post { autoUnpair(ed, a, ch, sLine, sCol) }
+                                    }
+                                }
                             }
                         }
                     }
@@ -736,6 +810,7 @@ fun CodeEditorView(
                 ap.ver = ver
                 ap.sig = ""
                 ap.lastCount = content.lineCount
+                ap.lastLen = content.length
                 try {
                     val ln = buffer.cursorLine.coerceIn(0, content.lineCount - 1)
                     ed.setSelection(ln, buffer.cursorCol.coerceIn(0, content.getColumnCount(ln)))
