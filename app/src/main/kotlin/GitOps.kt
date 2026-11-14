@@ -343,6 +343,19 @@ object GitOps {
         }
     }
 
+    /** Asks GitHub whether the saved token itself is bad (then the Reconnect dialog appears) or the problem is only permissions. */
+    private suspend fun checkAuth(r: GitResult.AuthFailed): GitResult = when (GitHubAuth.tokenValid()) {
+        false -> {
+            AuthBus.expire("GitHub rejected the saved sign-in while pushing.")
+            GitResult.AuthFailed("Your GitHub sign-in is no longer valid. Reconnect to continue.")
+        }
+        true -> GitResult.AuthFailed(
+            "GitHub accepts your sign-in but refused this repository. Your account may not have write access to it, " +
+                "or a branch protection rule applies."
+        )
+        null -> r
+    }
+
     /** When Git says "not found", ask GitHub's API what is really wrong so the message is exact. */
     private suspend fun diagnose(link: RepoLink, raw: String): GitResult {
         val t = Prefs.githubToken() ?: return GitResult.AuthFailed("Connect your GitHub account first.")
@@ -361,7 +374,10 @@ object GitOps {
                 else GitResult.Failed("GitHub has ${link.owner}/${link.repo}, but refused the Git connection ($raw). Try disconnecting and reconnecting GitHub in Settings → GitHub.")
             }
             404 -> GitResult.NotFound("GitHub can't find \"${link.owner}/${link.repo}\" for your account. Check the repository name in Repo Name & Branch (the owner comes from your GitHub URL in Settings).")
-            401 -> GitResult.AuthFailed("Your GitHub sign-in expired. Reconnect in Settings → GitHub.")
+            401 -> {
+                AuthBus.expire("GitHub rejected the saved sign-in.")
+                GitResult.AuthFailed("Your GitHub sign-in is no longer valid. Reconnect to continue.")
+            }
             else -> GitResult.Failed("GitHub answered HTTP ${r.code} while checking the repository.")
         }
     }
@@ -369,8 +385,11 @@ object GitOps {
     private suspend fun finish(e: Throwable, job: Job?, link: RepoLink): GitResult {
         if (job?.isActive == false) throw CancellationException("cancelled")
         if (e is CancellationException) throw e
-        val r = map(e)
-        return if (r is GitResult.NotFound) diagnose(link, r.detail) else r
+        return when (val r = map(e)) {
+            is GitResult.NotFound -> diagnose(link, r.detail)
+            is GitResult.AuthFailed -> checkAuth(r)
+            else -> r
+        }
     }
 
     // ---- commit ----
@@ -515,12 +534,14 @@ object GitOps {
             } catch (e: Throwable) {
                 if (job?.isActive == false) throw CancellationException("cancelled")
                 if (e is CancellationException) throw e
+                val m0 = map(e)
+                val m = if (m0 is GitResult.AuthFailed) checkAuth(m0) else m0
                 MergeOutcome.Failed(
-                    when (val r = map(e)) {
-                        is GitResult.Offline -> r.detail
-                        is GitResult.AuthFailed -> r.detail
-                        is GitResult.NotFound -> r.detail
-                        is GitResult.Failed -> r.detail
+                    when (m) {
+                        is GitResult.Offline -> m.detail
+                        is GitResult.AuthFailed -> m.detail
+                        is GitResult.NotFound -> m.detail
+                        is GitResult.Failed -> m.detail
                         else -> detail(e)
                     }
                 )
