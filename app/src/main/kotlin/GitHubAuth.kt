@@ -1,6 +1,11 @@
 package app.gitex
 
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -11,8 +16,13 @@ import java.net.SocketTimeoutException
 import java.net.URL
 import java.net.URLEncoder
 import java.net.UnknownHostException
+import java.text.DateFormat
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
 
-/** Tiny HTTPS helper shared by auth (now) and the GitHub API client (Phase 2). Never logs headers or bodies. */
+/** Tiny HTTPS helper shared by auth and the Gemini request. Never logs headers or bodies. */
 object Http {
     class Resp(val code: Int, val body: String, val headers: Map<String, List<String>>)
 
@@ -55,12 +65,31 @@ object Http {
 }
 
 /**
+ * Raised when GitHub really rejects the saved sign-in. The saved token is removed (it is useless now),
+ * and MainActivity shows a dialog with a one-tap Reconnect.
+ */
+object AuthBus {
+    var expired by mutableStateOf(false)
+    var reason by mutableStateOf("")
+
+    fun expire(why: String) {
+        Handler(Looper.getMainLooper()).post {
+            if (Prefs.githubConnected) {
+                Prefs.clearGithubToken()
+                reason = why
+                expired = true
+            }
+        }
+    }
+}
+
+/**
  * GitHub OAuth Device Flow: no client secret is needed, so nothing confidential ships in the APK.
  * The token is stored encrypted with an Android Keystore key (see Prefs / SecureStore).
  */
 object GitHubAuth {
     /** Public OAuth client id. The workflow can override it with the GITEX_CLIENT_ID repo variable. */
-    private const val DEFAULT_CLIENT_ID = "Ov23liFijOTyYvaxiFOa"
+    private const val DEFAULT_CLIENT_ID = "Ov23liKP6ILxzLnJKgCV"
 
     val clientId: String get() = BuildConfig.GITHUB_CLIENT_ID.ifBlank { DEFAULT_CLIENT_ID }
 
@@ -80,6 +109,15 @@ object GitHubAuth {
         object Denied : Poll()
         object Expired : Poll()
         class Error(val msg: String) : Poll()
+    }
+
+    @Volatile private var pendingExpiryMs = 0L
+
+    /** Expiry reported with the newest token (consumed when the token is saved). */
+    fun takePendingExpiry(): Long {
+        val v = pendingExpiryMs
+        pendingExpiryMs = 0L
+        return v
     }
 
     private fun form(vararg pairs: Pair<String, String>): String =
@@ -150,7 +188,11 @@ object GitHubAuth {
                 continue
             }
             val token = j.optString("access_token")
-            if (token.isNotEmpty()) return Poll.Token(token)
+            if (token.isNotEmpty()) {
+                val exp = j.optInt("expires_in", 0)
+                pendingExpiryMs = if (exp > 0) System.currentTimeMillis() + exp * 1000L else 0L
+                return Poll.Token(token)
+            }
             when (val err = j.optString("error")) {
                 "authorization_pending" -> {}
                 "slow_down" -> interval = j.optInt("interval", interval + 5).coerceAtLeast(interval + 5)
@@ -163,15 +205,58 @@ object GitHubAuth {
         return Poll.Expired
     }
 
-    /** The account's login name, or null if the lookup fails. */
+    private fun parseExpiry(h: String?): Long {
+        if (h.isNullOrBlank()) return 0L
+        return try {
+            val f = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+            f.timeZone = TimeZone.getTimeZone("UTC")
+            f.parse(h.trim().removeSuffix("UTC").trim())?.time ?: 0L
+        } catch (_: Exception) {
+            0L
+        }
+    }
+
+    /** The account's login name, or null if the lookup fails. Also notes whether GitHub gave this token an expiry time. */
     suspend fun fetchLogin(token: String): String? = try {
         val r = Http.request(
             "GET", "https://api.github.com/user",
             mapOf("Authorization" to "Bearer $token", "Accept" to "application/vnd.github+json")
         )
-        if (r.code == 200) JSONObject(r.body).optString("login").ifBlank { null } else null
+        if (r.code == 200) {
+            val ms = parseExpiry(r.headers["github-authentication-token-expiration"]?.firstOrNull())
+            if (ms > 0) {
+                Prefs.tokenExpiresAt = ms
+                val whenText = DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(ms))
+                Handler(Looper.getMainLooper()).post {
+                    Banners.show(
+                        "GitHub will end this sign-in on $whenText. If your GitHub app has expiring tokens turned on, " +
+                            "turn that off in its settings on github.com to stay signed in.",
+                        BannerKind.Info
+                    )
+                }
+            }
+            JSONObject(r.body).optString("login").ifBlank { null }
+        } else null
     } catch (_: Exception) {
         null
+    }
+
+    /** true = GitHub accepts the saved token, false = GitHub rejects it (or none is saved), null = couldn't tell (offline ...). */
+    suspend fun tokenValid(): Boolean? {
+        val t = Prefs.githubToken() ?: return false
+        return try {
+            val r = Http.request(
+                "GET", "https://api.github.com/user",
+                mapOf("Authorization" to "Bearer $t", "Accept" to "application/vnd.github+json")
+            )
+            when (r.code) {
+                200 -> true
+                401 -> false
+                else -> null
+            }
+        } catch (_: Exception) {
+            null
+        }
     }
 
     /**
