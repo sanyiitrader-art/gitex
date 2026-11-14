@@ -86,6 +86,7 @@ object GitHub {
         val body = try { c.errorStream?.bufferedReader()?.use { it.readText() } ?: "" } catch (_: Exception) { "" }
         val api = try { JSONObject(body).optString("message") } catch (_: Exception) { "" }
         val remaining = c.getHeaderField("x-ratelimit-remaining")
+        if (code == 401) AuthBus.expire("GitHub rejected the saved sign-in (HTTP 401${if (api.isNotBlank()) ": $api" else ""}).")
         val msg = when {
             code == 401 -> "GitHub sign-in expired or was revoked. Reconnect in Settings → GitHub."
             code == 403 && remaining == "0" -> "GitHub's request limit was reached. Try again in a few minutes."
@@ -225,7 +226,6 @@ object GitHub {
             arts.addAll(p.a)
             p.err?.let { errors.add(it) }
         }
-        // Artifacts whose run was not in the recent-runs page: look those runs up individually (a few at most).
         val missing = arts.filter { it.runId != 0L && it.runId !in runMap }.distinctBy { it.runId }.take(8)
         for (a in missing) {
             try { runMap[a.runId] = run(a.owner, a.repo, a.runId) } catch (_: GitHubException) { }
