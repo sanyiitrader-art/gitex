@@ -50,6 +50,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.geometry.Offset
@@ -77,9 +78,10 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.IOException
 import kotlin.math.roundToInt
 
-enum class XMode { Normal, Create, Rename, Select }
+enum class XMode { Normal, Create, Rename, Select, Copy, Move }
 
 /** Explorer state lives outside the drawer, so expanded folders and search text survive closing it. */
 class ExplorerState {
@@ -95,9 +97,15 @@ class ExplorerState {
     var query by mutableStateOf(TextFieldValue(""))
     var searching by mutableStateOf(false)
 
+    /** The file or folder being moved or copied. */
+    var clip by mutableStateOf<File?>(null)
+    /** True while a move/copy is running. */
+    var working by mutableStateOf(false)
+
     fun cancel() {
         mode = XMode.Normal
         target = null
+        clip = null
         selected.clear()
         input = TextFieldValue("")
         error = null
@@ -119,6 +127,56 @@ class ExplorerState {
             p = p.parentFile
         }
         highlighted = file.absolutePath
+    }
+}
+
+/** Copy and move on the real filesystem. Nothing is overwritten; failures leave no half-made copies behind. */
+object FileOps {
+    /** "name copy.ext", "name copy 2.ext", ... (folders have no extension). */
+    fun uniqueCopyName(dir: File, name: String, isDir: Boolean): String {
+        val dot = if (isDir) -1 else name.lastIndexOf('.')
+        val base = if (dot > 0) name.substring(0, dot) else name
+        val ext = if (dot > 0) name.substring(dot) else ""
+        var n = 1
+        while (true) {
+            val cand = if (n == 1) "$base copy$ext" else "$base copy $n$ext"
+            if (dir.list()?.none { it.equals(cand, ignoreCase = true) } != false) return cand
+            n++
+        }
+    }
+
+    fun copy(src: File, target: File): Result<File> = runCatching {
+        if (src.isDirectory) {
+            try {
+                if (!src.copyRecursively(target, overwrite = false)) throw IOException("Couldn't copy everything")
+                if (Fs.treeSize(src) != Fs.treeSize(target)) throw IOException("The copy is incomplete")
+            } catch (e: Throwable) {
+                target.deleteRecursively()
+                throw e
+            }
+        } else {
+            val dir = target.parentFile ?: throw IOException("No parent folder")
+            val tmp = File(dir, ".${target.name}.gitex-tmp")
+            try {
+                src.copyTo(tmp, overwrite = true)
+                if (tmp.length() != src.length()) throw IOException("The copy is incomplete")
+                if (!tmp.renameTo(target)) throw IOException("Couldn't finish the copy")
+            } finally {
+                if (tmp.exists()) tmp.delete()
+            }
+        }
+        target
+    }
+
+    /** Instant rename on the same storage volume; otherwise copy, verify, then remove the original. */
+    fun move(src: File, target: File): Result<File> = runCatching {
+        if (!src.renameTo(target)) {
+            copy(src, target).getOrThrow()
+            if (!src.deleteRecursively()) {
+                throw IOException("Copied, but the original couldn't be fully removed. Both are kept")
+            }
+        }
+        target
     }
 }
 
@@ -325,6 +383,7 @@ fun ExplorerDrawerContent(
     var itemMenu by remember { mutableStateOf<Pair<Offset, XRow.Item>?>(null) }
     var delTarget by remember { mutableStateOf<File?>(null) }
     var delSelected by remember { mutableStateOf(false) }
+    var pasteConflict by remember { mutableStateOf<Triple<File, File, File>?>(null) } // source, destination folder, existing item
     val searchFr = remember { FocusRequester() }
 
     OnDeadTap {
@@ -347,6 +406,14 @@ fun ExplorerDrawerContent(
     val maxDepth = remember(display) { display.maxOfOrNull { if (it is XRow.Item) it.depth else (it as XRow.Input).depth } ?: 0 }
     val full by remember(rows) { derivedStateOf { fullyChecked(rows, st.selected.toSet()) } }
 
+    fun remapExpanded(old: String, nw: String) {
+        for (i in st.expanded.indices) {
+            val e = st.expanded[i]
+            if (e == old) st.expanded[i] = nw
+            else if (e.startsWith(old + File.separator)) st.expanded[i] = nw + e.substring(old.length)
+        }
+    }
+
     fun toggleExpand(item: XRow.Item) {
         val p = item.file.absolutePath
         if (p in st.expanded) {
@@ -362,6 +429,13 @@ fun ExplorerDrawerContent(
         if (st.mode == XMode.Select) {
             if (item.isDir) toggleExpand(item)
             else if (p in st.selected) st.selected.remove(p) else st.selected.add(p)
+            return
+        }
+        if ((st.mode == XMode.Copy || st.mode == XMode.Move) && !item.isDir) {
+            // Tapping a file while copying or moving opens it and ends the mode.
+            st.cancel()
+            st.highlighted = p
+            onOpenFile(p)
             return
         }
         st.highlighted = p
@@ -386,6 +460,90 @@ fun ExplorerDrawerContent(
         st.input = TextFieldValue(f.name, TextRange(0, f.name.length)); st.error = null
     }
 
+    fun startClip(f: File, mode: XMode) {
+        st.cancel()
+        st.mode = mode
+        st.clip = f
+        st.highlighted = null // with nothing highlighted the destination is the project root
+    }
+
+    /** Same rule as creating: highlighted folder = inside it, highlighted file = its folder, nothing = project root. */
+    fun destDir(): File? {
+        val r = root ?: return null
+        val h = st.highlighted?.let { File(it) }
+        return when {
+            h == null -> r
+            h.isDirectory -> h
+            else -> h.parentFile ?: r
+        }
+    }
+
+    fun runPaste(src: File, dest: File, move: Boolean, replace: Boolean, keepBoth: Boolean) {
+        scope.launch {
+            st.working = true
+            var failure: String? = null
+            var result: File? = null
+            var trashed: File? = null
+            withContext(Dispatchers.IO) {
+                val existing = dest.listFiles()?.firstOrNull { it.name.equals(src.name, ignoreCase = true) }
+                if (replace && existing != null) {
+                    // The item being replaced goes to the Recycle Bin first, so it can always be restored.
+                    val t = Trash.moveToTrash(existing)
+                    val err = t.exceptionOrNull()
+                    if (err != null) failure = Fs.friendly(err) else trashed = existing
+                }
+                if (failure == null) {
+                    val name = if (keepBoth) FileOps.uniqueCopyName(dest, src.name, src.isDirectory) else src.name
+                    val target = File(dest, name)
+                    val r = if (move) FileOps.move(src, target) else FileOps.copy(src, target)
+                    r.onSuccess { result = it }.onFailure { failure = Fs.friendly(it) }
+                }
+            }
+            st.working = false
+            val gone = trashed
+            if (gone != null) ws.deleted(gone)
+            val err = failure
+            val res = result
+            if (err != null || res == null) {
+                ws.bump()
+                Banners.show(
+                    (err ?: "Couldn't finish") + if (gone != null) ". The item that was to be replaced is in the Recycle Bin." else "",
+                    BannerKind.Error
+                )
+                return@launch
+            }
+            if (move) {
+                ws.renamed(src, res)
+                remapExpanded(src.absolutePath, res.absolutePath)
+            }
+            st.cancel()
+            st.highlighted = res.absolutePath
+            hide()
+            ws.bump()
+            Banners.show(if (move) "Moved" else "Copied", BannerKind.Success)
+        }
+    }
+
+    fun doPaste() {
+        val src = st.clip ?: return
+        val r = root ?: return
+        val move = st.mode == XMode.Move
+        val dest = destDir() ?: return
+        if (st.working) return
+        if (!src.exists()) { Banners.show("That item no longer exists", BannerKind.Error); st.cancel(); return }
+        if (src.isDirectory && (dest.absolutePath == src.absolutePath || dest.absolutePath.startsWith(src.absolutePath + File.separator))) {
+            Banners.show("A folder can't go inside itself", BannerKind.Error); return
+        }
+        val sameFolder = src.parentFile?.absolutePath == dest.absolutePath
+        if (move && sameFolder) { Banners.show("It is already in this folder"); return }
+        if (!dest.canWrite()) { Banners.show("Gitex can't write to that folder", BannerKind.Error); return }
+        if (dest.absolutePath != r.absolutePath && dest.absolutePath !in st.expanded) st.expanded.add(dest.absolutePath)
+        if (!move && sameFolder) { runPaste(src, dest, false, replace = false, keepBoth = true); return }
+        val existing = dest.listFiles()?.firstOrNull { it.name.equals(src.name, ignoreCase = true) }
+        if (existing != null) { pasteConflict = Triple(src, dest, existing); return }
+        runPaste(src, dest, move, replace = false, keepBoth = false)
+    }
+
     fun save() {
         val text = st.input.text
         val target = st.target ?: return
@@ -406,14 +564,8 @@ fun ExplorerDrawerContent(
                 val r = withContext(Dispatchers.IO) { Fs.rename(target, text) }
                 r.onSuccess { nf ->
                     ws.renamed(target, nf)
-                    val old = target.absolutePath
-                    val nw = nf.absolutePath
-                    for (i in st.expanded.indices) {
-                        val e = st.expanded[i]
-                        if (e == old) st.expanded[i] = nw
-                        else if (e.startsWith(old + File.separator)) st.expanded[i] = nw + e.substring(old.length)
-                    }
-                    st.cancel(); st.highlighted = nw; hide()
+                    remapExpanded(target.absolutePath, nf.absolutePath)
+                    st.cancel(); st.highlighted = nf.absolutePath; hide()
                 }.onFailure { fail(Fs.friendly(it)) }
             }
         }
@@ -453,9 +605,37 @@ fun ExplorerDrawerContent(
                         TextBtn("Cancel", Gx.textDim) { st.cancel() }
                         TextBtn("Delete[${st.selected.size}]", Gx.danger, enabled = st.selected.isNotEmpty()) { delSelected = true }
                     }
+                    XMode.Copy -> {
+                        TextBtn("Cancel", Gx.textDim) { st.cancel() }
+                        TextBtn("Paste", enabled = !st.working) { doPaste() }
+                    }
+                    XMode.Move -> {
+                        TextBtn("Cancel", Gx.textDim) { st.cancel() }
+                        TextBtn("Move", enabled = !st.working) { doPaste() }
+                    }
                 }
             }
             Box(Modifier.fillMaxWidth().height(1.dp).background(Gx.border))
+            if (st.mode == XMode.Copy || st.mode == XMode.Move) {
+                val d = destDir()
+                Row(
+                    Modifier.fillMaxWidth().background(Gx.selected).padding(horizontal = 14.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        GText(
+                            "${if (st.mode == XMode.Copy) "Copying" else "Moving"} “${st.clip?.name ?: ""}”",
+                            style = Ty.small, maxLines = 1
+                        )
+                        GText(
+                            "Into: " + (if (d == null || d.absolutePath == root?.absolutePath) "project root" else d.name) +
+                                " · tap a folder to choose",
+                            style = Ty.tiny, color = Gx.textDim, maxLines = 1
+                        )
+                    }
+                    if (st.working) GSpinner(size = 18.dp)
+                }
+            }
         }
 
         // ---- search field (hides while scrolling up) ----
@@ -532,12 +712,13 @@ fun ExplorerDrawerContent(
                                         XMode.Select -> if (r.isDir) p in full else p in st.selected
                                         else -> st.highlighted == p
                                     }
-                                    Box(Modifier.padding(start = INDENT * r.depth, bottom = 6.dp).width(cardW)) {
+                                    val isSource = (st.mode == XMode.Copy || st.mode == XMode.Move) && st.clip?.absolutePath == p
+                                    Box(Modifier.padding(start = INDENT * r.depth, bottom = 6.dp).width(cardW).alpha(if (isSource) 0.5f else 1f)) {
                                         GCard(
                                             Modifier.fillMaxWidth(),
                                             selected = sel,
                                             onClick = { tap(r) },
-                                            onLongPress = { pos -> if (st.mode != XMode.Select) itemMenu = pos to r },
+                                            onLongPress = { pos -> if (st.mode == XMode.Normal) itemMenu = pos to r },
                                             padding = PaddingValues(horizontal = 12.dp, vertical = 11.dp)
                                         ) {
                                             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -561,7 +742,7 @@ fun ExplorerDrawerContent(
                 }
             }
 
-            // ---- floating search results ----
+            // ---- floating search results (clear accent border + glow so it stands out) ----
             if (st.searching && root != null) {
                 val files by produceState(emptyList<File>(), root, ws.treeVersion) { value = ws.projectFiles() }
                 val q = st.query.text.trim()
@@ -628,12 +809,30 @@ fun ExplorerDrawerContent(
     itemMenu?.let { (pos, item) ->
         val menuItems = buildList {
             add(MenuItem("Rename") { startRename(item.file) })
+            add(MenuItem("Move") { startClip(item.file, XMode.Move) })
+            add(MenuItem("Copy") { startClip(item.file, XMode.Copy) })
             if (!item.isDir) add(MenuItem("Select") {
                 st.cancel(); st.mode = XMode.Select; st.selected.add(item.file.absolutePath)
             })
             add(MenuItem("Delete", danger = true) { delTarget = item.file })
         }
         ContextMenu(pos, menuItems, onDismiss = { itemMenu = null })
+    }
+    pasteConflict?.let { (src, dest, existing) ->
+        GDialog(
+            onDismiss = { pasteConflict = null },
+            title = "\"${existing.name}\" already exists",
+            actions = listOf(
+                DialogBtn("Keep both", { pasteConflict = null; runPaste(src, dest, st.mode == XMode.Move, replace = false, keepBoth = true) }),
+                DialogBtn("Replace", { pasteConflict = null; runPaste(src, dest, st.mode == XMode.Move, replace = true, keepBoth = false) }, danger = true),
+            )
+        ) {
+            GText(
+                "A ${if (existing.isDirectory) "folder" else "file"} with this name is already in \"${dest.name}\".\n\n" +
+                    "Keep both adds \"copy\" to the new name. Replace moves the existing one to the Recycle Bin first, so it can be restored.",
+                color = Gx.textDim
+            )
+        }
     }
     delTarget?.let { f ->
         GDialog(
