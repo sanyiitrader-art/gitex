@@ -45,7 +45,73 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import java.io.File
 import kotlin.math.roundToInt
+
+// ---------------------------------------------------------------------------
+// Project Store: one folder that holds the user's projects
+// ---------------------------------------------------------------------------
+
+/** A folder picked in the system picker, waiting for the user to read the explanation and press Agree. */
+object StoreState {
+    var pending by mutableStateOf<File?>(null)
+}
+
+object StorePrefs {
+    private fun str(k: String, d: String) = PrefValue<String>(
+        k, d, { s, key, def -> s.getString(key, def) ?: def }, { e, key, v -> e.putString(key, v) })
+
+    private fun bool(k: String, d: Boolean) = PrefValue<Boolean>(
+        k, d, { s, key, def -> s.getBoolean(key, def) }, { e, key, v -> e.putBoolean(key, v) })
+
+    var path by str("store_path", "")
+    var showOnStart by bool("store_show_on_start", true)
+    var showHidden by bool("store_show_hidden", false)
+    /** name | opened | changed */
+    var sort by str("store_sort", "name")
+
+    private var opened: HashMap<String, Long>? = null
+
+    @Synchronized
+    private fun openedMap(): HashMap<String, Long> {
+        opened?.let { return it }
+        val m = HashMap<String, Long>()
+        try {
+            val o = JSONObject(Prefs.sp.getString("store_opened", "{}") ?: "{}")
+            for (k in o.keys()) m[k] = o.optLong(k)
+        } catch (_: Exception) {
+        }
+        opened = m
+        return m
+    }
+
+    @Synchronized
+    fun markOpened(p: String) {
+        val m = openedMap()
+        m[p] = System.currentTimeMillis()
+        if (m.size > 300) {
+            val keep = m.entries.sortedByDescending { it.value }.take(200).associate { it.key to it.value }
+            m.clear(); m.putAll(keep)
+        }
+        try {
+            val o = JSONObject()
+            for ((k, v) in m) o.put(k, v)
+            Prefs.sp.edit().putString("store_opened", o.toString()).apply()
+        } catch (_: Exception) {
+        }
+    }
+
+    @Synchronized
+    fun openedAt(p: String): Long = openedMap()[p] ?: 0L
+
+    fun dir(): File? = path.takeIf { it.isNotBlank() }?.let { File(it) }
+
+    fun available(): Boolean {
+        val d = dir() ?: return false
+        return d.isDirectory && d.canRead()
+    }
+}
 
 @Composable
 private fun Page(title: String, onBack: () -> Unit, content: @Composable ColumnScope.() -> Unit) {
@@ -114,8 +180,91 @@ fun SettingsHomeScreen(onBack: () -> Unit, onNavigate: (Route) -> Unit) {
             glow = true, onClick = { onNavigate(Route.SetGithub) })
         SettingCard(Ico.Robot, "Gemini", "API key, model and tree creation behaviour",
             glow = true, onClick = { onNavigate(Route.SetAi) })
+        SettingCard(Ico.Folder, "Project Store", "One folder that keeps all your projects, one tap away",
+            glow = true, onClick = { onNavigate(Route.SetStore) })
         SettingCard(Ico.Delete, "Recycle Bin", "Restore or permanently delete removed items",
             glow = true, onClick = { onNavigate(Route.Recycle) })
+    }
+}
+
+@Composable
+fun StoreSettingsScreen(onBack: () -> Unit, onChoose: () -> Unit) {
+    val dir = StorePrefs.dir()
+    val ok = StorePrefs.available()
+    var removeDlg by remember { mutableStateOf(false) }
+    val count by produceState(-1, dir?.absolutePath, StorePrefs.showHidden) {
+        value = withContext(Dispatchers.IO) {
+            if (dir == null || !ok) -1
+            else dir.listFiles()?.count { it.isDirectory && !Fs.isHiddenName(it.name) && (StorePrefs.showHidden || !it.name.startsWith(".")) } ?: 0
+        }
+    }
+
+    Page("Project Store", onBack) {
+        SettingCard(
+            Ico.Folder, "Store folder",
+            when {
+                dir == null -> "Not set. Tap to choose the folder that will hold your projects"
+                !ok -> "${dir.absolutePath}\nNot available right now. Tap to choose it again"
+                else -> "${dir.absolutePath}\n" + (if (count == 1) "1 project" else "$count projects")
+            },
+            glow = true, onClick = onChoose
+        )
+        if (dir != null) {
+            SettingCard(Ico.Delete, "Remove store folder", "Gitex forgets it. Nothing inside is deleted", onClick = { removeDlg = true })
+        }
+        ToggleCard(
+            Ico.Home, "Show on the start screen",
+            "Adds \"Choose from store\" next to Select Folder and Open file",
+            StorePrefs.showOnStart
+        ) { StorePrefs.showOnStart = it }
+        Dropdown(
+            Ico.Code, "Sort projects by",
+            listOf("name" to "Name", "opened" to "Recently opened", "changed" to "Recently changed"),
+            StorePrefs.sort
+        ) { StorePrefs.sort = it }
+        ToggleCard(
+            Ico.Folder, "Show hidden folders",
+            "Folders whose name starts with a dot", StorePrefs.showHidden
+        ) { StorePrefs.showHidden = it }
+        SettingCard(
+            Ico.Warning, "How it works",
+            "Each folder in the store is a project. Tap one on the start screen (or Menu → Open from store) to open it at once. " +
+                "\"New project\" there creates a folder in the store. Gitex never moves or deletes anything in the store by itself."
+        )
+    }
+
+    StoreState.pending?.let { picked ->
+        GDialog(
+            onDismiss = { StoreState.pending = null },
+            title = "Use this folder as your Project Store?",
+            cancel = DialogBtn("Cancel", { StoreState.pending = null }),
+            actions = listOf(DialogBtn("Agree", {
+                StorePrefs.path = picked.absolutePath
+                StoreState.pending = null
+                if (!picked.canWrite()) {
+                    Banners.show("Store set, but Gitex can't write there, so New project won't work.", BannerKind.Error)
+                } else Banners.show("Project Store set", BannerKind.Success)
+            }, primary = true))
+        ) {
+            GText(picked.absolutePath, style = Ty.small, color = Gx.accent, maxLines = 3)
+            Spacer(Modifier.height(10.dp))
+            GText(
+                "What the Project Store does:\n" +
+                    "• Shows this folder's projects and files on the start screen under \"Choose from store\", and in Menu → Open from store.\n" +
+                    "• Tapping a folder opens it as your project at once; tapping a file opens it in the editor.\n" +
+                    "• \"New project\" creates a folder here and opens it.\n" +
+                    "• Lists can be sorted, and folders with Git are marked.\n\n" +
+                    "Gitex never moves, changes or deletes anything in it by itself, and nothing is uploaded. " +
+                    "You can remove or change the store at any time; your files stay where they are.",
+                style = Ty.small, color = Gx.textDim
+            )
+        }
+    }
+    if (removeDlg) {
+        GDialog(
+            onDismiss = { removeDlg = false }, title = "Remove the store folder?",
+            actions = listOf(DialogBtn("Remove", { StorePrefs.path = ""; removeDlg = false; Banners.show("Project Store removed") }, danger = true))
+        ) { GText("Gitex only forgets which folder it was. All files and projects in it stay untouched.", color = Gx.textDim) }
     }
 }
 
