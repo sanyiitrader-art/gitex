@@ -76,7 +76,8 @@ class MainActivity : ComponentActivity() {
 
 enum class Route {
     Onboarding, Welcome, Main, SearchFile, SearchProject,
-    Settings, SetEditor, SetAppearance, SetTheme, SetGithub, SetAi, SetStore, Recycle, Actions, Log
+    Settings, SetEditor, SetAppearance, SetTheme, SetGithub, SetAi, SetStore, Recycle, Actions, Log,
+    Support, SupportLevel
 }
 
 @Composable
@@ -145,8 +146,29 @@ fun GitexRoot() {
         Duplicates.scan(ws)
     }
 
+    // Active-use timer: counts only while Gitex is on screen, saved every 15 seconds.
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(15_000)
+            UsageTracker.tick()
+        }
+    }
+
+    // After 3 hours of active use, the support invitation appears once (and only on the main screen).
+    val usage = UsageTracker.totalMs
+    LaunchedEffect(usage, route) {
+        if (usage >= SupportPrefs.INVITE_AT_MS && !SupportPrefs.inviteShown &&
+            route == Route.Main && Prefs.onboardingDone && Prefs.welcomeDone
+        ) {
+            SupportPrefs.inviteShown = true
+            SupportState.inviteOpen = true
+        }
+    }
+
     DisposableEffect(lifecycle) {
         val obs = LifecycleEventObserver { _, e ->
+            if (e == Lifecycle.Event.ON_RESUME) UsageTracker.resume()
+            if (e == Lifecycle.Event.ON_PAUSE) UsageTracker.pause()
             if (e == Lifecycle.Event.ON_RESUME && Prefs.onboardingDone) {
                 scope.launch { ws.refreshFromDisk() }
                 BuildState.refreshTick++
@@ -240,9 +262,19 @@ fun GitexRoot() {
                     go(Route.Log)
                 })
                 Route.Log -> FailureLogScreen(ActionsNav.logRepo, ActionsNav.logRunId) { back() }
+                Route.Support -> SupportScreen(onBack = { back() }, onLevel = { go(Route.SupportLevel) })
+                Route.SupportLevel -> SupportLevelScreen { back() }
             }
         }
         BannerHost()
+
+        // The large support invitation (once, after 3 hours of active use).
+        if (SupportState.inviteOpen) {
+            SupportInviteDialog(
+                onTry = { SupportState.inviteOpen = false; go(Route.Support) },
+                onClose = { SupportState.inviteOpen = false }
+            )
+        }
 
         // GitHub really rejected the saved sign-in: offer a one-tap reconnect from anywhere in the app.
         if (AuthBus.expired) {
