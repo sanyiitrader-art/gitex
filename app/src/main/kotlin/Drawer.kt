@@ -55,6 +55,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
@@ -795,6 +796,7 @@ fun ExplorerDrawerContent(
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             NavCard(Ico.Wrench, "Actions") { onNavigate(Route.Actions) }
+            NavCard(HeartIcon, "Community", sub = "build it together") { onNavigate(Route.Support) }
             NavCard(Ico.Gear, "Settings") { onNavigate(Route.Settings) }
         }
     }
@@ -862,12 +864,15 @@ private fun Modifier.height56(): Modifier = this.then(Modifier.heightIn(min = 56
 private fun Modifier.height16(): Modifier = this.then(Modifier.heightIn(min = 16.dp))
 
 @Composable
-private fun NavCard(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, onClick: () -> Unit) {
+private fun NavCard(icon: ImageVector, label: String, sub: String? = null, onClick: () -> Unit) {
     GCard(Modifier.fillMaxWidth(), onClick = onClick, padding = PaddingValues(horizontal = 16.dp, vertical = 14.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             GIcon(icon, tint = Gx.accent)
             Spacer(Modifier.width(16.dp))
-            GText(label, style = Ty.heading.copy(fontWeight = FontWeight.Medium))
+            Column {
+                GText(label, style = Ty.heading.copy(fontWeight = FontWeight.Medium))
+                if (sub != null) GText(sub, style = Ty.tiny, color = Gx.textDim, maxLines = 1)
+            }
         }
     }
 }
