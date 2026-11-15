@@ -82,12 +82,20 @@ private fun scan(s: String, q: String, maxHits: Int, onHit: (line: Int, col: Int
     }
 }
 
+/**
+ * The result text starts at the beginning of the word the match belongs to (typing "l" for "plugins"
+ * shows "plugins", not "lugins"), and only the typed part is highlighted.
+ */
 private fun snippet(text: String, col: Int, len: Int, hl: Color, hlBg: Color): AnnotatedString {
-    val s = text.substring(col.coerceIn(0, text.length)).trimEnd().take(240)
+    val c = col.coerceIn(0, text.length)
+    var start = c
+    while (start > 0 && (text[start - 1].isLetterOrDigit() || text[start - 1] == '_')) start--
+    val s = text.substring(start).trimEnd().take(240)
+    val from = c - start
     return buildAnnotatedString {
         append(s)
-        val e = len.coerceAtMost(s.length)
-        if (e > 0) addStyle(SpanStyle(color = hl, background = hlBg), 0, e)
+        val e = (from + len).coerceAtMost(s.length)
+        if (from < s.length && e > from) addStyle(SpanStyle(color = hl, background = hlBg), from, e)
     }
 }
 
@@ -225,7 +233,6 @@ fun FindInProjectScreen(
                 val before = acc.size
                 scan(text, query, MAX_HITS_PER_FILE) { line, col, t -> acc.add(ProjHit(path, line, col, t)) }
                 if (acc.size != before) {
-                    // publish progressively so results appear while the scan continues
                     val snapshot = ArrayList(acc)
                     withContext(Dispatchers.Main) { hits = snapshot }
                 }
