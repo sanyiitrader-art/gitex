@@ -360,10 +360,11 @@ private fun StoreBrowser(
     if (newDlg && store != null) {
         var name by remember { mutableStateOf(TextFieldValue("")) }
         var err by remember { mutableStateOf<String?>(null) }
-        val create = {
+        val create: () -> Unit = {
             val e = Fs.nameError(name.text, store)
-            if (e != null) err = e
-            else {
+            if (e != null) {
+                err = e
+            } else {
                 Fs.createDir(store, name.text)
                     .onSuccess { newDlg = false; refresh++; onProject(it) }
                     .onFailure { err = Fs.friendly(it) }
@@ -430,6 +431,8 @@ fun MainScreen(
     val imeVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
     val gitBusy = pushState == 1 || committing
     val storeSet = StorePrefs.dir() != null
+    // Names that appear more than once among the recent files: those cards also show their folder.
+    val dupNames = Prefs.recents.groupingBy { File(it).name.lowercase() }.eachCount().filterValues { it > 1 }.keys
 
     fun closeDrawer() { st.cancel(); st.searching = false; drawerOpen = false }
 
@@ -616,7 +619,14 @@ fun MainScreen(
                 if (cur == null) {
                     GText("No file open", style = Ty.small, color = Gx.textDim, modifier = Modifier.weight(1f))
                 } else {
-                    GText(File(cur).name, style = Ty.label, maxLines = 1, modifier = Modifier.weight(1f, fill = false))
+                    val curName = File(cur).name
+                    GText(curName, style = Ty.label, maxLines = 1, modifier = Modifier.weight(1f, fill = false))
+                    if (curName.lowercase() in dupNames) {
+                        GText(
+                            File(cur).parentFile?.name.orEmpty(), style = Ty.tiny, color = Gx.textDim, maxLines = 1,
+                            modifier = Modifier.padding(start = 8.dp).weight(1f, fill = false)
+                        )
+                    }
                     if (ws.dirty[cur] == true) {
                         Spacer(Modifier.width(8.dp))
                         Box(Modifier.size(8.dp).clip(CircleShape).background(Gx.accent))
@@ -663,10 +673,13 @@ fun MainScreen(
                             GButton("Choose from store", onClick = { storeOpen = true }, modifier = Modifier.fillMaxWidth(), primary = false, glow = true)
                         }
                     }
-                    buf.kind == FileKind.IMAGE -> ImageViewer(
-                        cur, ws.treeVersion,
-                        onReplace = { ReplaceState.target = File(cur); onPickImage() }
-                    )
+                    // A fresh viewer for every file: the previous picture can never linger on screen.
+                    buf.kind == FileKind.IMAGE -> key(cur, ws.treeVersion) {
+                        ImageViewer(
+                            cur, ws.treeVersion,
+                            onReplace = { ReplaceState.target = File(cur); onPickImage() }
+                        )
+                    }
                     mdMode -> {
                         val text = remember(cur, mdMode, ws.contentVersion) { buf.content?.toString() ?: "" }
                         MarkdownPreview(text)
@@ -707,7 +720,15 @@ fun MainScreen(
                                 Row(Modifier.fillMaxSize(), verticalAlignment = Alignment.CenterVertically) {
                                     FileIcon(name, size = 18.dp)
                                     Spacer(Modifier.width(8.dp))
-                                    GText(name, style = Ty.small, modifier = Modifier.weight(1f), maxLines = 1)
+                                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.Center) {
+                                        GText(name, style = Ty.small, maxLines = 1)
+                                        if (name.lowercase() in dupNames) {
+                                            GText(
+                                                File(path).parentFile?.name.orEmpty(),
+                                                style = Ty.tiny.copy(fontSize = 9.5.sp), color = Gx.textDim, maxLines = 1
+                                            )
+                                        }
+                                    }
                                     if (ws.dirty[path] == true) {
                                         Box(Modifier.size(6.dp).clip(CircleShape).background(Gx.accent))
                                     }
